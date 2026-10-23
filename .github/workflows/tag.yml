@@ -1,0 +1,29 @@
+# Tags every merged export with the next minor version (v0.1.0, v0.2.0, …).
+# setup-sandcastle installs the latest tag, so an untagged main is invisible
+# to projects until this runs.
+name: Tag
+
+on:
+  push:
+    branches: [main]
+    paths: [manifest.json]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: |
+          last=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          if [ -z "$last" ]; then next=v0.1.0; else
+            IFS=. read -r major minor _ <<< "${last#v}"
+            next="v${major}.$((minor + 1)).0"
+          fi
+          git tag "$next"
+          git push origin "$next"
+          echo "Tagged $next"

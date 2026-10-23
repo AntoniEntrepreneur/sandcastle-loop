@@ -1,0 +1,24 @@
+# Runs the loop's unit tests on every PR (export PRs included) and push to main.
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # `node --test` on .mts files needs Node's built-in type stripping.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+      # Before the first export there is no loop to test.
+      - if: hashFiles('.sandcastle/lib/**') != ''
+        run: node --test .sandcastle/lib/
