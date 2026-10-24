@@ -64,7 +64,7 @@ const SAVE_REASON_TEXT: Record<SaveReason, string> = {
   "iteration-ended": "iteration ended",
   "run-died": "run died",
   "found-dirty-at-start": "found dirty at start",
-  formatted: "black formatting",
+  formatted: "formatting",
 };
 
 /** Subject prefix that marks a commit as an orchestrator save, not an agent's own. */

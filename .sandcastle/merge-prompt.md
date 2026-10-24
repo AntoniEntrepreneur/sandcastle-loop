@@ -21,14 +21,14 @@ fit this branch's changes onto it, rather than reverting either side.
 
 ## Checks
 
-The output of `make test && make lint` after the clean merges, if it failed:
+The output of `{{CHECK_COMMAND}}` after the clean merges, if it failed:
 
 <check-output>
 {{CHECK_OUTPUT}}
 </check-output>
 
-Once everything is merged, run `make test` and `make lint` (the repo's real
-entry points — there is no `npm run test` at the root) and fix what fails in a
+Once everything is merged, run `{{CHECK_COMMAND}}` (the repo's real check)
+and fix what fails in a
 follow-up commit. A failure here usually means two branches built in parallel
 — or this branch and what main gained since — broke each other; fix the
 combination, do not revert either side's work.

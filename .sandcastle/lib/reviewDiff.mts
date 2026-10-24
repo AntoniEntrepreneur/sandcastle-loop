@@ -1,21 +1,18 @@
 // Reviewer cost controls: which model reviews a branch and whether the diff is
 // pasted whole. Pure functions over `git diff --numstat` text and token counts.
 
-/** Lockfiles that don't count toward a diff's size. */
-export const LOCKFILES = ["package-lock.json", "frontend/package-lock.json", "uv.lock"];
-
 /** Changed lines at which the reviewer moves from Sonnet to Opus. */
 export const OPUS_LINE_THRESHOLD = 200;
 
 /** Estimated tokens above which the reviewer gets a `--stat` summary. */
 export const FULL_DIFF_TOKEN_LIMIT = 15_000;
 
-/** Added plus removed lines in `git diff --numstat` output, lockfiles ignored. */
-export function changedLines(numstat: string): number {
+/** Added plus removed lines in `git diff --numstat` output, `lockfiles` ignored. */
+export function changedLines(numstat: string, lockfiles: string[]): number {
   let total = 0;
   for (const line of numstat.split("\n")) {
     const [added, removed, path] = line.split("\t");
-    if (path === undefined || LOCKFILES.includes(path.trim())) continue;
+    if (path === undefined || lockfiles.includes(path.trim())) continue;
     total += (Number(added) || 0) + (Number(removed) || 0);
   }
   return total;

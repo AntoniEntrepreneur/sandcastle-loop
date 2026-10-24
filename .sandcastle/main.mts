@@ -27,8 +27,8 @@
 //                               can be cut short; the reviewer follows if it
 //                               committed. Issues run concurrently.
 //   Phase 3 (Merge):            git merges the completed branches and the
-//                               integration sandbox runs make test / make
-//                               lint. An agent is called only for a conflict
+//                               integration sandbox runs the project's
+//                               check. An agent is called only for a conflict
 //                               or a red result. Agents never start on a red
 //                               integration branch.
 //   Phase 4 (PR):               Push and open (or refresh) a DRAFT PR. It is
@@ -81,6 +81,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -119,13 +120,15 @@ import { resumeRunOptions } from "./lib/resumeRun.mts";
 import {
   extractAvoidTerms,
   extractPrBody,
+  fillProjectPlaceholders,
   parentIssueNumber,
   renderIssueContext,
   type IssueText,
 } from "./lib/promptInputs.mts";
-import { IMAGE_HASH_LABEL, IMAGE_INPUT_FILES, computeImageHash } from "./lib/imageHash.mts";
+import { IMAGE_HASH_LABEL, computeImageHash } from "./lib/imageHash.mts";
 import { formatUsageTable, logsToDelete, sessionUsage, type UsageRow } from "./lib/runReport.mts";
 import { muteSounds, reportOutcome } from "./notify.mts";
+import { config } from "./sandcastle.config.mts";
 import {
   nextClockTime,
   parseCommandLine,
@@ -177,42 +180,21 @@ const MAX_ITERATIONS = 6;
 // stop a dead run instead of burning the remainder on container starts.
 const MAX_IMPLEMENTER_ITERATIONS = 100;
 
-// Hooks run inside the sandbox before the agent starts. The agent's feedback
-// loop is `make test` / `make lint`, so all three toolchains it reaches for —
-// root node, frontend node, and the Python env uv manages — must be present, or
-// the loop fails in a way the agent will read as a broken repo.
+// Hooks run inside the sandbox before the agent starts.
 // Every sandbox installs from cold, and the 60s default is a budget for a
 // top-up rather than an install. A hook that times out throws the whole group
 // away *after* the agents have done their expensive work. Slow is recoverable;
-// dead is not — and this one budget now covers the whole chain below, which
-// runs in sequence rather than three installs racing each other.
+// dead is not — and this one budget covers the whole setup command, which
+// runs in sequence rather than installs racing each other.
 const HOOK_TIMEOUT_MS = 20 * 60 * 1000;
 
-// One command, not four. Sandcastle runs the entries of a hook list
-// concurrently, so a reset listed after the installs does not follow them: it
-// finished first, npm rewrote frontend/package-lock.json behind it, and every
-// sandbox handed its agent a worktree that was already dirty.
-//
-// That dirt is indistinguishable from an interrupted agent, so Phase 0 refuses
-// to pick the branch up — permanently, since every run redoes the same
-// install. Finished commits then never reach a PR, and `gh pr merge` cannot
-// clean up the worktree afterwards. Setup must leave no trace; this all runs
-// before the agent starts, so a lockfile change the agent genuinely intends is
-// unaffected.
-//
-// The image ships the dependency trees outside the worktree (see Dockerfile);
-// the first two steps link them in, so the installs below only top up whatever
-// an agent changed. UV_PROJECT_ENVIRONMENT in the image points `uv sync` at the
-// prebuilt venv.
-const SETUP_COMMAND = [
-  "rm -rf node_modules frontend/node_modules",
-  "ln -s /home/agent/deps/node_modules node_modules",
-  "ln -s /home/agent/deps/frontend-node_modules frontend/node_modules",
-  "npm install",
-  "npm install --prefix frontend",
-  "uv sync",
-  "git checkout -- package-lock.json frontend/package-lock.json",
-].join(" && ");
+// The project's setup command must leave no trace: dirt in the worktree is
+// indistinguishable from an interrupted agent, so Phase 0 would refuse to pick
+// the branch up — permanently, since every run redoes the same install.
+// Finished commits then never reach a PR, and `gh pr merge` cannot clean up
+// the worktree afterwards. It all runs before the agent starts, so a lockfile
+// change the agent genuinely intends is unaffected.
+const SETUP_COMMAND = config.setupCommand;
 
 const hooks = {
   sandbox: {
@@ -222,10 +204,10 @@ const hooks = {
 
 // What "the integration branch is green" means. The setup is repeated first
 // because a merge can change a lockfile, and on a warm sandbox it is a top-up.
-const CHECK_COMMAND = `${SETUP_COMMAND} && make test && make lint`;
+const CHECK_COMMAND = `${SETUP_COMMAND} && ${config.checkCommand}`;
 
 // How much of a failed check's output is kept, for a log line or a prompt. The
-// end is where pytest, vitest and eslint print what failed.
+// end is where test runners and linters print what failed.
 const CHECK_OUTPUT_TAIL_CHARS = 6000;
 
 // Nothing is copied from the host. node_modules was, to make the hooks above a
@@ -235,32 +217,27 @@ const CHECK_OUTPUT_TAIL_CHARS = 6000;
 // reconcile them, and that reconciliation rewrote the lockfiles on a good day
 // and died with ENOTEMPTY on a bad one.
 //
-// What is shared instead is the download caches, which hold tarballs and
-// Linux wheels rather than an installed tree, so every sandbox's install
-// still runs cold against its own platform but stops re-downloading. Both
-// caches are safe to share between concurrent sandboxes: npm's is
-// content-addressed and uv locks its own. uv cannot hardlink across the bind
-// mounts, so it is told to copy rather than warn about falling back to it.
+// What is shared instead is the project's download caches, which hold tarballs
+// and wheels rather than an installed tree, so every sandbox's install still
+// runs cold against its own platform but stops re-downloading.
 const CACHE_DIR = ".sandcastle/cache";
 const runState = openRunState(CACHE_DIR);
 
 function sandboxProvider() {
-  const npmCache = join(CACHE_DIR, "npm");
-  const uvCache = join(CACHE_DIR, "uv");
-  mkdirSync(npmCache, { recursive: true });
-  mkdirSync(uvCache, { recursive: true });
+  const mounts = config.cacheMounts.map(({ name, sandboxPath }) => {
+    const hostPath = join(CACHE_DIR, name);
+    mkdirSync(hostPath, { recursive: true });
+    return { hostPath, sandboxPath };
+  });
   return docker({
-    mounts: [
-      { hostPath: npmCache, sandboxPath: "/home/agent/.npm" },
-      { hostPath: uvCache, sandboxPath: "/home/agent/.cache/uv" },
-    ],
-    // The backend suite outlasts Claude Code's 2-minute Bash default, which
+    mounts,
+    // A long test suite outlasts Claude Code's 2-minute Bash default, which
     // moved it to the background: agents then polled it with `sleep` loops,
     // and some went silent long enough for the 600s idle timeout to kill them.
     // Commands now stay in the foreground, with 8 minutes to finish — under
     // that idle timeout.
     env: {
-      UV_LINK_MODE: "copy",
+      ...config.sandboxEnv,
       CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
       BASH_DEFAULT_TIMEOUT_MS: String(8 * 60 * 1000),
     },
@@ -346,7 +323,8 @@ function issueContextFor(number: number): string {
 }
 
 /**
- * The prompt files as they were when this run started.
+ * The prompt files as they were when this run started, with the project's
+ * placeholders already filled in.
  *
  * This script is loaded once, but the SDK reads a prompt file from disk at
  * every run() call. A prompt edited mid-run therefore met code that predated
@@ -356,9 +334,14 @@ function issueContextFor(number: number): string {
 const PROMPTS_DIR = mkdtempSync(join(tmpdir(), "sandcastle-prompts-"));
 const PROMPTS = (() => {
   const dir = PROMPTS_DIR;
+  const projectValues = {
+    PROJECT_NOTES: readFileSync(join(".sandcastle", "project-notes.md"), "utf-8").trim(),
+    CHECK_COMMAND: config.checkCommand,
+  };
   const snapshot = (name: string) => {
     const copy = join(dir, name);
-    copyFileSync(join(".sandcastle", name), copy);
+    const text = readFileSync(join(".sandcastle", name), "utf-8");
+    writeFileSync(copy, fillProjectPlaceholders(text, projectValues));
     return copy;
   };
   return {
@@ -841,8 +824,8 @@ type MergeCandidate = { id: string; title: string; branch: string };
  *
  * It is always opened on the named integration branch. The bind-mount default
  * is the "head" strategy, which mounts the developer's own checkout: every
- * setup hook then ran against it, which replaced the Mac's
- * frontend/node_modules with Linux binaries, rewrote the lockfile, and let the
+ * setup hook then ran against it, which replaced the Mac's node_modules with
+ * Linux binaries, rewrote the lockfile, and let the
  * merger `git stash` the developer's working tree. A named branch gets a
  * worktree under .sandcastle/worktrees/ instead, exactly as an issue sandbox
  * always has.
@@ -862,10 +845,10 @@ class IntegrationSandbox {
     return this.#sandbox;
   }
 
-  /** Run `make test` and `make lint`; the tail of their output if they failed. */
+  /** Run the project's check; the tail of its output if it failed. */
   async #check(): Promise<string | undefined> {
     const sandbox = await this.#open();
-    console.log(`Checking ${this.branch} with make test and make lint…`);
+    console.log(`Checking ${this.branch} with ${config.checkCommand}…`);
     const result = await sandbox.exec(withTimeLimit(CHECK_COMMAND));
     this.#knownGreen = result.exitCode === 0;
     return checkFailureTail(result.exitCode, result.stdout, result.stderr, CHECK_OUTPUT_TAIL_CHARS);
@@ -882,7 +865,7 @@ class IntegrationSandbox {
     const failure = await this.#check();
     if (failure === undefined) return;
     throw new BranchStateError(
-      `${this.branch} fails make test / make lint before any agent has worked on it this cycle. Fix it by hand — on main, if the branch was cut from a red main — then re-run Sandcastle.\n\n${failure}`,
+      `${this.branch} fails ${config.checkCommand} before any agent has worked on it this cycle. Fix it by hand — on main, if the branch was cut from a red main — then re-run Sandcastle.\n\n${failure}`,
     );
   }
 
@@ -1167,9 +1150,10 @@ async function workIssue(
 
   const issueNumber = Number(issue.id);
   const issueContext = issueContextFor(issueNumber);
-  const avoidTerms = extractAvoidTerms(
-    readFileSync(join(REPO_CWD, "GLOSSARY.md"), "utf-8"),
-  ).join(", ");
+  const avoidTerms =
+    config.glossaryFile === undefined
+      ? undefined
+      : extractAvoidTerms(readFileSync(join(REPO_CWD, config.glossaryFile), "utf-8")).join(", ");
   let last: Awaited<ReturnType<typeof sandbox.run>> | undefined;
   let lastRole = "implementer";
   let lastOptions: Parameters<typeof sandbox.run>[0] | undefined;
@@ -1201,7 +1185,7 @@ async function workIssue(
                 TASK_ID: issue.id,
                 ISSUE_TITLE: issue.title,
                 ISSUE_CONTEXT: issueContext,
-                AVOID_TERMS: avoidTerms,
+                ...(avoidTerms === undefined ? {} : { AVOID_TERMS: avoidTerms }),
                 BRANCH: issue.branch,
                 INTEGRATION_BRANCH: integrationBranch,
                 CHECK_FAILURE: extraPrompt ?? "",
@@ -1238,6 +1222,7 @@ async function workIssue(
       chooseReviewerModel(
         changedLines(
           gitIn(sandbox.worktreePath, ["diff", "--numstat", `${integrationBranch}...${issue.branch}`]),
+          config.lockfiles,
         ),
       ),
   };
@@ -1247,6 +1232,7 @@ async function workIssue(
       maxSteps: MAX_IMPLEMENTER_ITERATIONS,
       continuePrompt: IMPLEMENTER_CONTINUE_PROMPT,
       checkCommand: withTimeLimit(CHECK_COMMAND),
+      formatCommand: config.formatCommand,
       log: (message) => console.log(`#${issue.id}: ${message}`),
       pastEndTime,
     });
@@ -1595,7 +1581,7 @@ if (DRY_RUN) {
         numstat === undefined
           ? "no branch yet — chosen from its diff once the implementer finishes"
           : (({ model, reason }) => `${model} (${reason})`)(
-              chooseReviewerModel(changedLines(numstat)),
+              chooseReviewerModel(changedLines(numstat, config.lockfiles)),
             );
       console.log(`  #${issue.number}: ${choice}`);
     }
@@ -1615,7 +1601,7 @@ if (DRY_RUN) {
 /** Hash of the lockfiles and Dockerfile as they are now. */
 function currentImageHash(): string {
   return computeImageHash(
-    IMAGE_INPUT_FILES.map((name) => ({
+    config.imageInputFiles.map((name) => ({
       name,
       content: readFileSync(join(REPO_CWD, name), "utf-8"),
     })),
@@ -1641,7 +1627,7 @@ function rebuildImage(): void {
   console.log(`\nLockfiles changed — rebuilding sandbox image… (about 2-4 minutes)`);
   const context = mkdtempSync(join(tmpdir(), "sandcastle-image-"));
   try {
-    for (const name of IMAGE_INPUT_FILES) {
+    for (const name of config.imageInputFiles) {
       const target = join(context, name === ".sandcastle/Dockerfile" ? "Dockerfile" : name);
       mkdirSync(dirname(target), { recursive: true });
       copyFileSync(join(REPO_CWD, name), target);
