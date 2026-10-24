@@ -1,0 +1,39 @@
+{
+  "engineVersion": "0.12.0",
+  "sourceCommit": "b5a9445f39114c1355d03729d1a28385c05f1b82",
+  "files": [
+    ".sandcastle/.gitignore",
+    ".sandcastle/implement-prompt.md",
+    ".sandcastle/lib/gitFacts.mts",
+    ".sandcastle/lib/gitFacts.test.mts",
+    ".sandcastle/lib/groups.mts",
+    ".sandcastle/lib/groups.test.mts",
+    ".sandcastle/lib/imageHash.mts",
+    ".sandcastle/lib/imageHash.test.mts",
+    ".sandcastle/lib/issueLoop.mts",
+    ".sandcastle/lib/issueLoop.test.mts",
+    ".sandcastle/lib/overnight.mts",
+    ".sandcastle/lib/overnight.test.mts",
+    ".sandcastle/lib/promptInputs.mts",
+    ".sandcastle/lib/promptInputs.test.mts",
+    ".sandcastle/lib/quotaGate.test.mts",
+    ".sandcastle/lib/resumeRun.mts",
+    ".sandcastle/lib/resumeRun.test.mts",
+    ".sandcastle/lib/reviewDiff.mts",
+    ".sandcastle/lib/reviewDiff.test.mts",
+    ".sandcastle/lib/runReport.mts",
+    ".sandcastle/lib/runReport.test.mts",
+    ".sandcastle/lib/runState.mts",
+    ".sandcastle/lib/runState.test.mts",
+    ".sandcastle/main.mts",
+    ".sandcastle/merge-prompt.md",
+    ".sandcastle/notify.mts",
+    ".sandcastle/pr-prompt.md",
+    ".sandcastle/review-prompt.md",
+    "patches/@ai-hero+sandcastle+0.12.0.patch"
+  ],
+  "projectFiles": [
+    ".sandcastle/Dockerfile",
+    ".sandcastle/CODING_STANDARDS.md"
+  ]
+}
