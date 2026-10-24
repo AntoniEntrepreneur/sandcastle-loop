@@ -1,0 +1,70 @@
+diff --git a/node_modules/@ai-hero/sandcastle/dist/index.js b/node_modules/@ai-hero/sandcastle/dist/index.js
+index 2a1d6d7..043bd6a 100644
+--- a/node_modules/@ai-hero/sandcastle/dist/index.js
++++ b/node_modules/@ai-hero/sandcastle/dist/index.js
+@@ -298,7 +298,8 @@ var invokeAgent = (sandbox, sandboxRepoDir, prompt, provider, idleTimeoutMs, com
+       return yield* Effect_exports.fail(
+         new AgentError({
+           message: `${provider.name} exited with code ${execResult.exitCode}:
+-${errorDetail}`
++${errorDetail}`,
++          sessionId
+         })
+       );
+     }
+@@ -472,6 +473,25 @@ var orchestrate = (options) => {
+               iterationResumeSession,
+               iterationForkSession,
+               options.signal
++            ).pipe(
++              // A failed run (e.g. a usage limit) keeps its session on the host
++              // so the caller can resume it; the id stays only if the copy worked.
++              Effect_exports.catchAll((e) => {
++                if (!(e instanceof AgentError) || !e.sessionId || !provider.captureSessions || !provider.sessionStorage || !bindMountHandle) {
++                  return Effect_exports.fail(e);
++                }
++                return Effect_exports.flatMap(
++                  Effect_exports.promise(
++                    () => provider.sessionStorage.captureToHost({
++                      hostCwd: hostRepoDir,
++                      sandboxCwd: ctx.sandboxRepoDir,
++                      sessionId: e.sessionId,
++                      handle: bindMountHandle
++                    }).then(() => true, () => false)
++                  ),
++                  (captured) => Effect_exports.fail(captured ? e : new AgentError({ message: e.message }))
++                );
++              })
+             );
+             textBuffer.dispose();
+             yield* display.status(label("Agent stopped"), "info");
+@@ -1674,6 +1694,7 @@ var buildSandboxHandle = (ctx, close) => {
+         streamEmitterLayer
+       );
+       let result;
++      let failedSessionId;
+       try {
+         result = await Effect_exports.runPromise(
+           Effect_exports.gen(function* () {
+@@ -1695,7 +1716,11 @@ var buildSandboxHandle = (ctx, close) => {
+               skipPromptExpansion: isInlinePrompt,
+               timeouts,
+               keepSourceBranch: mergeToHead
+-            });
++            }).pipe(
++              Effect_exports.tapError((e) => Effect_exports.sync(() => {
++                if (e instanceof AgentError) failedSessionId = e.sessionId;
++              }))
++            );
+             const completion = buildCompletionMessage(
+               orchestrateResult.completionSignal,
+               orchestrateResult.iterations.length
+@@ -1711,6 +1736,8 @@ var buildSandboxHandle = (ctx, close) => {
+         );
+       } catch (error) {
+         runOptions.signal?.throwIfAborted();
++        // runPromise's FiberFailure drops AgentError's fields, so the id rides on it directly.
++        if (failedSessionId && error !== null && typeof error === "object") error.sessionId = failedSessionId;
+         throw error;
+       }
+       const baseResult = {
