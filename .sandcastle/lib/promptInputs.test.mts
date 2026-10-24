@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import {
   extractAvoidTerms,
   extractPrBody,
+  fillProjectPlaceholders,
   parentIssueNumber,
   renderIssueContext,
 } from "./promptInputs.mts";
@@ -77,4 +78,15 @@ test("the PR body is the last tagged block the writer output", () => {
 test("a writer that output no body yields none", () => {
   assert.equal(extractPrBody("<promise>COMPLETE</promise>"), undefined);
   assert.equal(extractPrBody("<pr-body>  </pr-body>"), undefined);
+});
+
+/** Pins that project notes can carry a run-time placeholder through to the SDK. */
+test("project placeholders are filled and run-time ones left for the SDK", () => {
+  const prompt = "Run `{{CHECK_COMMAND}}`.\n{{PROJECT_NOTES}}\nFix {{TASK_ID}}.";
+  const filled = fillProjectPlaceholders(prompt, {
+    CHECK_COMMAND: "make test",
+    PROJECT_NOTES: "Avoid: {{AVOID_TERMS}}",
+  });
+
+  assert.equal(filled, "Run `make test`.\nAvoid: {{AVOID_TERMS}}\nFix {{TASK_ID}}.");
 });

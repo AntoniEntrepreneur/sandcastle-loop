@@ -78,13 +78,11 @@ If applicable, use RGR to complete the task.
 
 # FEEDBACK LOOPS
 
-Your feedback loop is the targeted test files for what you changed
-(`uv run pytest tests/path/test_x.py`, `npx vitest run path` in `frontend`).
-When they pass, your last check is done: output the completion signal. The
-full suite belongs to the orchestrator — it runs `black`, `make test` and
-`make lint` when you signal completion, and resumes you with the failing
-output if any is red. There is no `npm run test` or `npm run typecheck` at the
-repo root.
+Your feedback loop is the targeted test files for what you changed (PROJECT
+NOTES below says how to run them). When they pass, your last check is done:
+output the completion signal. The full suite belongs to the orchestrator — it
+runs the formatter and `{{CHECK_COMMAND}}` when you signal completion, and
+resumes you with the failing output if any is red.
 
 **Commit first, then verify.** As soon as the change is written and you believe
 it is right, commit it. Run the targeted tests afterwards and fix what they
@@ -95,20 +93,16 @@ to decide whether you are making progress.
 # THIRD-PARTY FACTS
 
 Every flag, subcommand, API path, config key or file convention you write for a
-service outside this repo (Railway, GitHub, Clerk, Cloudflare, Sentry, Next.js…)
-is checked against its source before you commit: `<cli> <command> --help` for a
-CLI the sandbox has (`railway`, `gh`), otherwise the vendor's docs via
+service outside this repo (GitHub, hosting, auth, frameworks…) is checked
+against its source before you commit: `<cli> <command> --help` for a CLI the
+sandbox has (`gh`, and any PROJECT NOTES names), otherwise the vendor's docs via
 WebFetch. Name the URL or command in the commit's key decisions. One no source
 confirms goes in the commit's `Blockers or notes for next iteration` as
 unverified, so the PR carries it to the human who runs it.
 
-# SCREENSHOTS
+# PROJECT NOTES
 
-For a visual change, headless Chromium is at `/usr/bin/chromium`. Start the
-app with `uv run uvicorn backend.main:app --port 8000 >/tmp/api.log 2>&1 &` and
-`npm run dev --prefix frontend >/tmp/web.log 2>&1 &`, then
-`chromium --headless --no-sandbox --screenshot=/tmp/shot.png --window-size=390,844 http://127.0.0.1:3000/login`
-(390×844 is a phone).
+{{PROJECT_NOTES}}
 
 # COMMIT
 
@@ -135,11 +129,6 @@ If the task is not complete, leave a comment on the issue with what was done.
 Do not close the issue - this will be done later.
 
 Once complete, output <promise>COMPLETE</promise>.
-
-# GLOSSARY
-
-The glossary hook refuses edits that use these terms. Use the canonical term
-from GLOSSARY.md instead: {{AVOID_TERMS}}
 
 # FINAL RULES
 

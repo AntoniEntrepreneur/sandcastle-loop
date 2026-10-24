@@ -2,7 +2,8 @@
 //
 // The image carries project dependencies, so it is stale exactly when a
 // lockfile or the Dockerfile changes. The hash is stored as an image label and
-// compared with the current one before each run. Pure; main.mts reads the files.
+// compared with the current one before each run. Pure; main.mts reads the
+// files the project config lists.
 
 import { createHash } from "node:crypto";
 
@@ -11,17 +12,6 @@ export interface ImageInput {
   name: string;
   content: string;
 }
-
-/** Repo-relative files whose contents decide whether the image is current. */
-export const IMAGE_INPUT_FILES = [
-  "package.json",
-  "package-lock.json",
-  "frontend/package.json",
-  "frontend/package-lock.json",
-  "pyproject.toml",
-  "uv.lock",
-  ".sandcastle/Dockerfile",
-];
 
 /** Label the image carries its input hash under. */
 export const IMAGE_HASH_LABEL = "sandcastle.deps-hash";

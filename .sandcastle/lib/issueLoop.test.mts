@@ -237,12 +237,20 @@ test("an already-aborted signal starts nothing but still saves", async () => {
   assert.deepEqual(saves, ["run-died"]);
 });
 
-/** Pins that black runs, and its changes are committed, before every check. */
-test("black runs, and its changes are committed, before every check", async () => {
+/** Pins that the formatter runs, and its changes are committed, before every check. */
+test("the formatter runs, and its changes are committed, before every check", async () => {
+  const { ports, execs, saves } = fakePorts([run({ completed: true }), run()]);
+  await runIssueLoop(ports, { ...options, formatCommand: "FORMAT" });
+  assert.deepEqual(execs, ["FORMAT", "CHECK", "FORMAT", "CHECK"]);
+  assert.ok(saves.includes("formatted"));
+});
+
+/** Pins that a project with no formatter goes straight to the check. */
+test("a project with no formatter goes straight to the check", async () => {
   const { ports, execs, saves } = fakePorts([run({ completed: true }), run()]);
   await runIssueLoop(ports, options);
-  assert.deepEqual(execs, ["uv run black backend tests", "CHECK", "uv run black backend tests", "CHECK"]);
-  assert.ok(saves.includes("formatted"));
+  assert.deepEqual(execs, ["CHECK", "CHECK"]);
+  assert.ok(!saves.includes("formatted"));
 });
 
 /** Pins that a red check resumes the implementer with the output tail; green then writes Done. */

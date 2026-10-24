@@ -16,9 +16,6 @@ import { quotaStopKind, type QuotaStopKind } from "./overnight.mts";
 /** Fix-and-recheck rounds allowed after a red check, per role. */
 export const MAX_CHECK_ROUNDS = 3;
 
-/** Formats exactly what pre-commit's black hook covers. */
-export const BLACK_COMMAND = "uv run black backend tests";
-
 /** How much of a red check's output goes back to the agent. */
 export const CHECK_TAIL_CHARS = 6000;
 
@@ -141,6 +138,8 @@ export type IssueLoopOptions = {
   continuePrompt: string;
   /** The full check, already wrapped in its time limit. */
   checkCommand: string;
+  /** The project's formatter, run and committed before every check; none when absent. */
+  formatCommand?: string;
   /** Called with a message for the operator log. */
   log?: (message: string) => void;
   /** True once an overnight run's end time has passed: no further agent run starts. */
@@ -158,15 +157,17 @@ const fixPrompt = (tail: string) =>
   `The check (full test suite and lint) failed. The end of its output:\n\n${tail}\n\nFix these failures, commit, and signal completion again.`;
 
 /**
- * Run `black`, commit what it changed, then the full check. Returns the output
- * tail when the check is red (a timeout counts as red), undefined when green.
+ * Run the formatter, commit what it changed, then the full check. Returns the
+ * output tail when the check is red (a timeout counts as red), undefined when green.
  */
 async function formatAndCheck(
   ports: IssueLoopPorts,
   options: IssueLoopOptions,
 ): Promise<string | undefined> {
-  await ports.exec(BLACK_COMMAND);
-  ports.saveWorktree("formatted");
+  if (options.formatCommand !== undefined) {
+    await ports.exec(options.formatCommand);
+    ports.saveWorktree("formatted");
+  }
   const result = await ports.exec(options.checkCommand);
   return checkFailureTail(result.exitCode, result.stdout, result.stderr, CHECK_TAIL_CHARS);
 }

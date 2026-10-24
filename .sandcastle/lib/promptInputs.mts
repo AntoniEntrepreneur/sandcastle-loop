@@ -56,3 +56,12 @@ export function extractPrBody(stdout: string): string | undefined {
   const body = matches.at(-1)?.[1]?.trim();
   return body ? body : undefined;
 }
+
+/**
+ * A prompt with the project's own placeholders filled in, before the SDK sees
+ * it. Run-time placeholders are left alone, including any the project notes
+ * bring in, so the SDK still fills them per run.
+ */
+export function fillProjectPlaceholders(prompt: string, values: Record<string, string>): string {
+  return prompt.replace(/\{\{(\w+)\}\}/g, (match, key: string) => values[key] ?? match);
+}

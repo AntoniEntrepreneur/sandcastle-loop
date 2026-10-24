@@ -24,9 +24,11 @@ test("200 changed lines goes to Opus", () => {
   assert.match(choice.reason, /200/);
 });
 
+const LOCKFILES = ["package-lock.json", "frontend/package-lock.json", "uv.lock"];
+
 /** Pins that changed lines sum added and removed. */
 test("changed lines sum added and removed", () => {
-  assert.equal(changedLines("10\t5\tbackend/a.py\n3\t0\tREADME.md\n"), 18);
+  assert.equal(changedLines("10\t5\tbackend/a.py\n3\t0\tREADME.md\n", LOCKFILES), 18);
 });
 
 /** Pins that lockfile-only change counts as zero. */
@@ -36,12 +38,12 @@ test("lockfile-only change counts as zero", () => {
     "5000\t10\tfrontend/package-lock.json",
     "300\t200\tuv.lock",
   ].join("\n");
-  assert.equal(changedLines(numstat), 0);
+  assert.equal(changedLines(numstat, LOCKFILES), 0);
 });
 
 /** Pins that binary files (dashes) count as zero. */
 test("binary files (dashes) count as zero", () => {
-  assert.equal(changedLines("-\t-\tlogo.png\n4\t1\ta.ts"), 5);
+  assert.equal(changedLines("-\t-\tlogo.png\n4\t1\ta.ts", LOCKFILES), 5);
 });
 
 /** Pins that tokens are estimated at four characters each. */
