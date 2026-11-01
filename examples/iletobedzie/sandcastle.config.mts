@@ -42,6 +42,8 @@ export const config: ProjectConfig = {
     ".sandcastle/Dockerfile",
   ],
   lockfiles: ["package-lock.json", "frontend/package-lock.json", "uv.lock"],
+  // pytest's tree, vitest's tree, and the loop's own `*.test.mts`.
+  testFiles: [/^tests\//, /^frontend\/test\//, /\.test\.m?tsx?$/],
   // npm's cache is content-addressed and uv locks its own, so both are safe to
   // share between concurrent sandboxes.
   cacheMounts: [

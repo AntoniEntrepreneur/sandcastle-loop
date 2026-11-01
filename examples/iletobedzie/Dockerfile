@@ -45,6 +45,13 @@ USER ${AGENT_UID}:${AGENT_GID}
 # Install Claude Code CLI
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
+# Install the Antigravity CLI (agy), unconditionally so switching
+# --implementer never changes this image's hash or forces a rebuild (#730).
+# Install command confirmed on the official docs' Quickstart (macOS/Linux
+# tab): https://antigravity.google/docs/getting-started/. It installs to
+# ~/.local/bin/agy, already on PATH below.
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
+
 # Install uv: `make test` runs pytest through it, `make lint` runs black.
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 

@@ -24,6 +24,8 @@ import {
   parseBlockedByLine,
   parseDoneTrailers,
   partitionIntoGroups,
+  replannedAfterMerge,
+  sharedFailure,
   type Issue,
 } from "./groups.mts";
 
@@ -362,6 +364,35 @@ test("a resumed branch with no newly merged issues still explains itself", () =>
   assert.ok(body.includes("Carried forward from an earlier interrupted run"));
 });
 
+/** Pins the per-issue "implemented by" lines, and the fallback for an issue with no recorded label. */
+test("a merged issue's PR body names who implemented it, falling back for an unrecorded one", () => {
+  const body = buildPrBody({
+    group: { id: "218", parentIssue: 218, issues: [] },
+    mergedIssues: [
+      { id: "244", title: "Report agy's tokens" },
+      { id: "245", title: "Something Claude built" },
+    ],
+    blockedIssues: [],
+    complete: true,
+    implementers: { byIssue: { "244": "gemini-3.8-flash-high (agy)" }, fallback: "claude-sonnet-5" },
+  });
+
+  assert.ok(body.includes("#244: implemented by gemini-3.8-flash-high (agy)"));
+  assert.ok(body.includes("#245: implemented by claude-sonnet-5"));
+});
+
+/** Pins that a caller that names no implementers gets the body it got before #731. */
+test("a PR body with no implementers carries no implemented-by lines", () => {
+  const body = buildPrBody({
+    group: { id: "218", parentIssue: 218, issues: [] },
+    mergedIssues: [{ id: "245", title: "Emit expression structure" }],
+    blockedIssues: [],
+    complete: true,
+  });
+
+  assert.ok(!body.includes("implemented by"));
+});
+
 test("a group with a blocked issue lists it and why, even though the batch is complete otherwise", () => {
   const body = buildPrBody({
     group: { id: "218", parentIssue: 218, issues: [] },
@@ -521,7 +552,15 @@ test("checkFailureTail is undefined for a green check", () => {
 
 /** Pins that checkFailureTail returns the end of the output for a red check. */
 test("checkFailureTail returns the end of the output for a red check", () => {
-  assert.equal(checkFailureTail(1, "abcdef", "ghi", 5), "f\nghi".slice(-5));
+  assert.equal(checkFailureTail(1, "abcdef", "ghi", 5), "ef\nhi");
+});
+
+/** Pins that checkFailureTail keeps a stdout failure that later stderr noise would push out. */
+test("checkFailureTail keeps a stdout failure followed by more than the tail of stderr noise", () => {
+  const tail = checkFailureTail(1, "banned term: micro-skill", "warn\n".repeat(2000), 6000);
+  assert.ok(tail !== undefined);
+  assert.match(tail, /banned term: micro-skill/);
+  assert.ok(tail.length <= 6000);
 });
 
 /** Pins that checkFailureTail counts a timeout (exit 124) as red and says it timed out. */
@@ -540,4 +579,57 @@ test("mergerFailureVerdict rethrows quota and auth failures", () => {
 /** Pins that mergerFailureVerdict judges an idle timeout by what the merger left. */
 test("mergerFailureVerdict judges an idle timeout by what the merger left", () => {
   assert.equal(mergerFailureVerdict("Idle timeout: no output for 600s"), "judge-branch");
+});
+
+const limitStop = "AgentError: claude-code exited with code 1:\nYou've hit your 5-hour limit · resets 1:20am (UTC)";
+
+/** Pins the overnight run of 2026-10-28, where an unmatched quota wording failed every issue for five cycles. */
+test("every planned issue failing with the same message is a shared failure", () => {
+  assert.equal(
+    sharedFailure(
+      [
+        { issue: "837", message: limitStop },
+        { issue: "838", message: limitStop },
+      ],
+      2,
+    ),
+    limitStop,
+  );
+});
+
+test("failures that differ only by their own issue number are still shared", () => {
+  const failures = ["837", "838"].map((issue) => ({
+    issue,
+    message: `Implementer for #${issue} produced nothing in 3 consecutive iterations`,
+  }));
+  assert.equal(sharedFailure(failures, 2), failures[0]!.message);
+});
+
+test("one planned issue failing proves nothing shared", () => {
+  assert.equal(sharedFailure([{ issue: "837", message: limitStop }], 1), undefined);
+});
+
+test("a cycle where some issue did not fail has no shared failure", () => {
+  const failures = [
+    { issue: "837", message: limitStop },
+    { issue: "838", message: limitStop },
+  ];
+  assert.equal(sharedFailure(failures, 3), undefined);
+});
+
+test("different failure messages are not a shared failure", () => {
+  const failures = [
+    { issue: "837", message: limitStop },
+    { issue: "838", message: "AgentError: claude-code exited with code 1:\nTypeError: x is undefined" },
+  ];
+  assert.equal(sharedFailure(failures, 2), undefined);
+});
+
+/** Pins #855's symptom: merged issues re-planned because their Done markers went unseen. */
+test("an issue merged last cycle and planned again is replanned after merge", () => {
+  assert.deepEqual(replannedAfterMerge(["837", "840"], ["837", "838", "840"]), ["837", "840"]);
+});
+
+test("a plan holding none of last cycle's merges is not a replan", () => {
+  assert.deepEqual(replannedAfterMerge(["837"], ["839", "845"]), []);
 });

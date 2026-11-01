@@ -25,6 +25,8 @@ export interface ProjectConfig {
   imageInputFiles: string[];
   /** Lockfiles that don't count toward a diff's size. */
   lockfiles: string[];
+  /** Repo-relative test file paths that don't count toward the size that picks the reviewer model; omit to count everything. */
+  testFiles?: RegExp[];
   /** Download caches shared between sandboxes; each must tolerate concurrent use. */
   cacheMounts: CacheMount[];
   /** Extra environment variables for every sandbox. */

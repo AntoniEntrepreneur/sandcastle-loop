@@ -24,13 +24,18 @@
 //                               forced through when everything is blocked.
 //   Phase 2 (Execute + Review): Per issue, a sandbox is created. The implementer
 //                               is driven one iteration at a time so a dead run
-//                               can be cut short; the reviewer follows if it
-//                               committed. Issues run concurrently.
+//                               can be cut short; the reviewer follows if the
+//                               branch differs from the integration branch.
+//                               Issues run concurrently, and a cycle whose
+//                               issues all fail the same way ends the run.
 //   Phase 3 (Merge):            git merges the completed branches and the
 //                               integration sandbox runs the project's
 //                               check. An agent is called only for a conflict
 //                               or a red result. Agents never start on a red
-//                               integration branch.
+//                               integration branch. A tree the check has
+//                               already passed — here or in an issue
+//                               sandbox, this run or an earlier one — is
+//                               not checked again.
 //   Phase 4 (PR):               Push and open (or refresh) a DRAFT PR. It is
 //                               marked ready for review only once the group has
 //                               nothing planned, nothing blocked, and nothing
@@ -46,8 +51,10 @@
 //   npm run sandcastle -- 244       # one group only
 //   npm run sandcastle -- solo-365  # one solo issue only
 //   npm run sandcastle -- refresh   # only merge main into every open batch PR
+//   npm run sandcastle -- prune     # delete local branches and worktrees whose work shipped
 //   npm run sandcastle -- --overnight               # leave it running; see below
 //   npm run sandcastle -- 244 --overnight --until 06:30
+//   npm run sandcastle -- 244 --implementer agy     # Gemini implements #244; see below
 //   SANDCASTLE_DRY_RUN=1 npm run sandcastle
 //   SANDCASTLE_WAIT_FOR_QUOTA=1 npm run sandcastle  # sleep through quota stops, no end time
 //   SANDCASTLE_IGNORE_QUOTA_GATE=1 npm run sandcastle  # start before the recorded reset
@@ -61,6 +68,29 @@
 // still ends the run. It also keeps the Mac awake (lid open, on power) and
 // mutes the end-of-run sound.
 //
+// --implementer agy names an Antigravity (`agy`) agent running
+// gemini-3.8-flash-high (lib/antigravity.mts) as the implementer, and only
+// the implementer: the reviewer, merger and PR writer stay on Claude. Its
+// fix rounds and follow-up steps resume the conversation in the issue's
+// sandbox, but a dead agy run starts cold on its branch next time — the
+// conversation stays in the sandbox that ran it — so its session is never
+// saved and the dry-run plan's saved-sessions list leaves it out. Its shell commands
+// pass the same dangerous-git guard as Claude's, through the workspace's
+// .agents/hooks.json (#733).
+// An unknown value stops the run before anything starts, naming the accepted
+// values. With --overnight it sleeps through a Gemini quota stop as it does a
+// Claude one, until the reset `agy -p "/usage"` reports, kept on a clock of
+// its own in the run state (lib/runState.mts). It needs `agy` already
+// signed in to the developer's Google/Antigravity account: a one-word probe
+// checks the host's quota at run start, and two files — the Google OAuth
+// credentials and the Antigravity OAuth token, not the whole ~/.gemini
+// folder (lib/antigravity.mts) — are mounted into the sandbox. Either file
+// missing on the host stops the run before any sandbox is built, naming
+// `agy` as the sign-in command. The exit token table labels its row
+// gemini-3.8-flash-high, with input, output, thinking and cache-read tokens
+// read from the stream's own result usage; the PR body names the actual
+// implementer per issue, Claude or Gemini (lib/groups.mts, lib/runState.mts).
+//
 // The argument is always a group id, so what you can run by hand is decided by
 // the admission label. An issue carrying the bare `sandcastle` label is the
 // group `solo-<its number>`, which is how you name it above. An issue inside a
@@ -69,6 +99,7 @@
 // sandbox each to report they have nothing to do.
 
 import * as sandcastle from "@ai-hero/sandcastle";
+import type { IterationResult, IterationUsage } from "@ai-hero/sandcastle";
 import { defaultImageName, docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { execFile, execFileSync, execSync, spawn } from "node:child_process";
 import {
@@ -89,12 +120,14 @@ import { promisify } from "node:util";
 
 import {
   catchUpWithRemote,
+  cleanTree,
   doneIssues,
   isBatchBranchShipped,
   isBehind,
   isStale,
   markDone,
   mergeEach,
+  prunableBranches,
   readyToMerge,
   saveWorktree,
   unfinishedBranches,
@@ -115,6 +148,13 @@ import {
   type IssueLoopPorts,
   type RunResult,
 } from "./lib/issueLoop.mts";
+import {
+  agySignInMounts,
+  agyThinkingTokens,
+  antigravity,
+  missingAgySignInFiles,
+  parseGeminiQuotaReset,
+} from "./lib/antigravity.mts";
 import { openRunState } from "./lib/runState.mts";
 import { resumeRunOptions } from "./lib/resumeRun.mts";
 import {
@@ -135,6 +175,8 @@ import {
   planQuotaWait,
   QUOTA_WAIT_MARGIN_MS,
   type CommandLine,
+  type QuotaProvider,
+  type QuotaStopKind,
 } from "./lib/overnight.mts";
 import {
   batchBranchGlob,
@@ -155,6 +197,8 @@ import {
   parseBlockedByLine,
   partitionIntoGroups,
   quotaGate,
+  replannedAfterMerge,
+  sharedFailure,
   shouldProbeQuota,
   type Group,
   type Issue,
@@ -210,6 +254,9 @@ const CHECK_COMMAND = `${SETUP_COMMAND} && ${config.checkCommand}`;
 // end is where test runners and linters print what failed.
 const CHECK_OUTPUT_TAIL_CHARS = 6000;
 
+/** How much of a failed quota probe's output is worth reporting. */
+const PROBE_FAILURE_CHARS = 300;
+
 // Nothing is copied from the host. node_modules was, to make the hooks above a
 // top-up rather than a cold install, but the host is Darwin arm64 and the
 // sandbox is Linux aarch64: the tree carries platform-specific binaries like
@@ -229,6 +276,9 @@ function sandboxProvider() {
     mkdirSync(hostPath, { recursive: true });
     return { hostPath, sandboxPath };
   });
+  // Only these two files, never the whole ~/.gemini folder — see
+  // lib/antigravity.mts for which, and why they're writable (#730).
+  if (IMPLEMENTER === "agy") mounts.push(...agySignInMounts());
   return docker({
     mounts,
     // A long test suite outlasts Claude Code's 2-minute Bash default, which
@@ -272,6 +322,42 @@ try {
 const IGNORE_QUOTA_GATE = process.env.SANDCASTLE_IGNORE_QUOTA_GATE === "1";
 const OVERNIGHT = commandLine.overnight;
 const WAIT_FOR_QUOTA = OVERNIGHT || process.env.SANDCASTLE_WAIT_FOR_QUOTA === "1";
+
+/** The model every Claude role runs, the implementer included while #725 lands. */
+const CLAUDE_MODEL = "claude-sonnet-5";
+
+// --implementer agy (#729): names the implementer in the plan and adds its own
+// one-word quota probe below. The reviewer, merger and PR writer stay on
+// Claude regardless.
+const IMPLEMENTER = commandLine.implementer;
+const AGY_IMPLEMENTER_MODEL = "gemini-3.8-flash-high";
+/** Names this run's implementer in the PR body's "implemented by" line (#731). */
+const IMPLEMENTER_LABEL = IMPLEMENTER === "agy" ? `${AGY_IMPLEMENTER_MODEL} (agy)` : CLAUDE_MODEL;
+
+// Fail before any sandbox is built, not with a dead implementer later (#730):
+// the sign-in files are created by running `agy` once on the host, which
+// opens a browser for Google sign-in.
+if (IMPLEMENTER === "agy") {
+  const missing = missingAgySignInFiles();
+  if (missing.length > 0) {
+    console.error(
+      `--implementer agy needs these sign-in files, missing on this machine:\n${missing
+        .map((path) => `  ${path}`)
+        .join("\n")}\n\nRun \`agy\` once on the host and sign in with your Google account — it writes both files — then re-run Sandcastle.`,
+    );
+    process.exit(1);
+  }
+}
+
+// The implementer's agent, and only the implementer's — the reviewer, merger
+// and PR writer are built with sandcastle.claudeCode(CLAUDE_MODEL) directly,
+// unaffected by --implementer (#730).
+const IMPLEMENTER_AGENT =
+  IMPLEMENTER === "agy" ? antigravity(AGY_IMPLEMENTER_MODEL) : sandcastle.claudeCode(CLAUDE_MODEL);
+
+/** Whose quota this run spends, each gated on its own reset: Claude always, Gemini under --implementer agy. */
+const QUOTA_PROVIDERS: QuotaProvider[] = IMPLEMENTER === "agy" ? ["claude", "gemini"] : ["claude"];
+const PROVIDER_NAMES: Record<QuotaProvider, string> = { claude: "Claude", gemini: "Gemini" };
 
 /** When an overnight run stops starting agents; undefined for any other run. */
 const END_AT = commandLine.until ? nextClockTime(commandLine.until, new Date()) : undefined;
@@ -396,8 +482,12 @@ const RUN_STARTED_MS = Date.now();
 /** Assistant message ids already in usageRows; a resumed session repeats them. */
 const countedMessages = new Set<string>();
 
-/** Record the token use of one finished agent step from its captured session. */
-function recordUsage(issue: string, role: string, iterations: readonly { sessionFilePath?: string }[]): void {
+/**
+ * Record the token use of one finished Claude step from its captured session.
+ * The iteration's own `usage` is not read: it is the last message's context
+ * window, not what the step spent (lib/runReport.mts).
+ */
+function recordSessionUsage(issue: string, role: string, iterations: readonly IterationResult[]): void {
   for (const { sessionFilePath } of iterations) {
     if (!sessionFilePath) continue;
     let jsonl: string;
@@ -408,6 +498,40 @@ function recordUsage(issue: string, role: string, iterations: readonly { session
     }
     usageRows.push({ issue, role, ...sessionUsage(jsonl, RUN_STARTED_MS, countedMessages) });
   }
+}
+
+// Each `agy` conversation's running total so far. A resumed turn's result
+// usage is the whole conversation's total, so a step's spend is the difference.
+const agyConversationTotals = new Map<string, IterationUsage & { thinkingTokens: number }>();
+
+/**
+ * Record the token use of one finished `agy` step from the totals its stream
+ * reported (#731). `agy` copies no session to the host, so there is no JSONL
+ * to dedupe against. A resumed conversation reports its cumulative usage
+ * (checked against `agy` 1.4.6, #788), so each step records the difference from
+ * the conversation's previous total.
+ */
+function recordStreamUsage(issue: string, role: string, iterations: readonly IterationResult[]): void {
+  for (const { usage, sessionId } of iterations) {
+    if (!usage) continue;
+    const total = { ...usage, thinkingTokens: agyThinkingTokens(usage) };
+    const prev = sessionId ? agyConversationTotals.get(sessionId) : undefined;
+    if (sessionId) agyConversationTotals.set(sessionId, total);
+    usageRows.push({
+      issue,
+      role,
+      inputTokens: usage.inputTokens - (prev?.inputTokens ?? 0),
+      outputTokens: usage.outputTokens - (prev?.outputTokens ?? 0),
+      thinkingTokens: total.thinkingTokens - (prev?.thinkingTokens ?? 0),
+      cacheReadTokens: usage.cacheReadInputTokens - (prev?.cacheReadInputTokens ?? 0),
+    });
+  }
+}
+
+/** Record the implementer's token use, labelled and sourced by which agent ran. */
+function recordImplementerUsage(issue: string, iterations: readonly IterationResult[]): void {
+  if (IMPLEMENTER === "agy") recordStreamUsage(issue, AGY_IMPLEMENTER_MODEL, iterations);
+  else recordSessionUsage(issue, "implementer", iterations);
 }
 
 // One exit handler covers every way a run ends — success, empty, failed,
@@ -811,6 +935,23 @@ function errorText(error: unknown): string {
   return error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
 }
 
+/** A thrown value's message without its stack, for comparing failures. */
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The stop for a cycle whose issues all failed with `message`. The quota is
+ * probed first: a quota stop in wording no pattern knows reads as a shared
+ * failure, and a probe that names it lets the run wait for the reset instead.
+ */
+function sharedFailureStop(message: string): RunFatalError {
+  const quotaStop =
+    probeQuota("claude", CLAUDE_PROBE_MODEL) ??
+    (IMPLEMENTER === "agy" ? probeQuota("agy", AGY_IMPLEMENTER_MODEL) : undefined);
+  return quotaStop ?? new RunFatalError("shared", message.slice(0, 300));
+}
+
 // ---------------------------------------------------------------------------
 // The integration sandbox: checks and merges
 // ---------------------------------------------------------------------------
@@ -845,12 +986,19 @@ class IntegrationSandbox {
     return this.#sandbox;
   }
 
-  /** Run the project's check; the tail of its output if it failed. */
+  /** Run the project's check, unless this exact tree already passed it; the tail of its output if it failed. */
   async #check(): Promise<string | undefined> {
     const sandbox = await this.#open();
+    const tree = cleanTree(sandbox.worktreePath);
+    if (tree !== undefined && runState.isGreenTree(tree)) {
+      console.log(`${this.branch} already passed ${config.checkCommand} at this tree — not checking it again.`);
+      this.#knownGreen = true;
+      return undefined;
+    }
     console.log(`Checking ${this.branch} with ${config.checkCommand}…`);
     const result = await sandbox.exec(withTimeLimit(CHECK_COMMAND));
     this.#knownGreen = result.exitCode === 0;
+    if (this.#knownGreen && tree !== undefined) runState.recordGreenTree(tree);
     return checkFailureTail(result.exitCode, result.stdout, result.stderr, CHECK_OUTPUT_TAIL_CHARS);
   }
 
@@ -921,9 +1069,10 @@ class IntegrationSandbox {
   ): Promise<void> {
     const sandbox = await this.#open();
 
-    const { merged, conflicted } = mergeEach(sandbox.worktreePath, branches);
+    const { merged, conflicted, conflictFiles } = mergeEach(sandbox.worktreePath, branches);
+    const conflictLine = (branch: string) => `${branch} (in ${conflictFiles[branch]?.join(", ") || "unknown files"})`;
     for (const branch of merged) console.log(`  merged ${branch}`);
-    for (const branch of conflicted) console.log(`  ${branch} conflicts — handing it to the merger agent`);
+    for (const branch of conflicted) console.log(`  ${conflictLine(branch)} conflicts — handing it to the merger agent`);
 
     // With a conflict outstanding the agent runs the checks itself once it has
     // resolved it, so checking the half-merged batch here would be wasted.
@@ -935,18 +1084,18 @@ class IntegrationSandbox {
       const result = await sandbox.run({
         name: "merger",
         maxIterations: 1,
-        agent: sandcastle.claudeCode("claude-sonnet-5"),
+        agent: sandcastle.claudeCode(CLAUDE_MODEL),
         promptFile: PROMPTS.merge,
         promptArgs: {
           CONFLICTED:
             conflicted.length > 0
-              ? conflicted.map((branch) => `- ${branch}`).join("\n")
+              ? conflicted.map((branch) => `- ${conflictLine(branch)}`).join("\n")
               : "(none — every branch merged cleanly)",
           ISSUES: issueList,
           CHECK_OUTPUT: failure ?? "(not run yet — run them yourself once the merges are done)",
         },
       });
-      recordUsage("batch", "merger", result.iterations);
+      recordSessionUsage("batch", "merger", result.iterations);
       throwIfRunFatal(result.stdout);
     } catch (error) {
       if (error instanceof RunFatalError) throw error;
@@ -988,11 +1137,11 @@ class IntegrationSandbox {
       const result = await sandbox.run({
         name: "pr-writer",
         maxIterations: 1,
-        agent: sandcastle.claudeCode("claude-sonnet-5"),
+        agent: sandcastle.claudeCode(CLAUDE_MODEL),
         promptFile: PROMPTS.pr,
         promptArgs: { ISSUES: issueList, BASE_REF },
       });
-      recordUsage("batch", "pr-writer", result.iterations);
+      recordSessionUsage("batch", "pr-writer", result.iterations);
       const body = extractPrBody(result.stdout);
       if (body === undefined) console.log("  the PR writer output no body — keeping the generated one");
       return body;
@@ -1159,7 +1308,15 @@ async function workIssue(
   let lastOptions: Parameters<typeof sandbox.run>[0] | undefined;
   const toRunResult = (result: Awaited<ReturnType<typeof sandbox.run>>): RunResult => {
     last = result;
-    recordUsage(`#${issue.id}`, lastRole, result.iterations ?? []);
+    if (lastRole === "implementer") {
+      // The token table's row and the PR body's "implemented by" line both name
+      // this run's actual implementer, not just the generic role, so an agy
+      // issue and a Claude one read differently in the same batch (#731).
+      runState.recordImplementer(issueNumber, IMPLEMENTER_LABEL);
+      recordImplementerUsage(`#${issue.id}`, result.iterations ?? []);
+    } else {
+      recordSessionUsage(`#${issue.id}`, lastRole, result.iterations ?? []);
+    }
     return {
       stdout: result.stdout,
       commits: result.commits,
@@ -1178,7 +1335,7 @@ async function workIssue(
               name: `implementer#${issue.id}`,
               maxIterations: 1,
               resumeSession: resumeSessionId,
-              agent: sandcastle.claudeCode("claude-sonnet-5"),
+              agent: IMPLEMENTER_AGENT,
               signal: cycleAbort.signal,
               promptFile: PROMPTS.implement,
               promptArgs: {
@@ -1202,6 +1359,7 @@ async function workIssue(
                 BRANCH: issue.branch,
                 INTEGRATION_BRANCH: integrationBranch,
                 DIFF: reviewDiffFor(sandbox.worktreePath, integrationBranch, issue.branch),
+                CHECK_FAILURE: extraPrompt ?? "",
               },
             };
       return toRunResult(await sandbox.run(lastOptions));
@@ -1215,16 +1373,25 @@ async function workIssue(
     saveWorktree: (reason) => saveWorktree(sandbox.worktreePath, issueNumber, reason),
     writeDone: () => markDone(sandbox.worktreePath, issueNumber, integrationBranch),
     readSession: () => runState.loadSession(issueNumber),
-    writeSession: (sessionId) => runState.saveSession(issueNumber, sessionId),
+    // An agy conversation stays in this sandbox (lib/antigravity.mts), so a later run could never resume it.
+    writeSession: (sessionId) => {
+      if (IMPLEMENTER !== "agy") runState.saveSession(issueNumber, sessionId);
+    },
     clearSession: () => runState.clearSession(issueNumber),
     abortSignal: cycleAbort.signal,
+    cleanTree: () => cleanTree(sandbox.worktreePath),
+    isGreenTree: (tree) => runState.isGreenTree(tree),
+    recordGreenTree: (tree) => runState.recordGreenTree(tree),
     reviewerModel: () =>
       chooseReviewerModel(
         changedLines(
           gitIn(sandbox.worktreePath, ["diff", "--numstat", `${integrationBranch}...${issue.branch}`]),
           config.lockfiles,
+          config.testFiles,
         ),
       ),
+    hasChanges: () =>
+      gitIn(sandbox.worktreePath, ["diff", "--name-only", `${integrationBranch}...${issue.branch}`]) !== "",
   };
 
   try {
@@ -1233,7 +1400,18 @@ async function workIssue(
       continuePrompt: IMPLEMENTER_CONTINUE_PROMPT,
       checkCommand: withTimeLimit(CHECK_COMMAND),
       formatCommand: config.formatCommand,
-      log: (message) => console.log(`#${issue.id}: ${message}`),
+      // Every loop message also goes into the agent log of the run just
+      // finished, so a check result or a cold start sits beside the step it
+      // follows there, not only in the run log (#810).
+      log: (message) => {
+        console.log(`#${issue.id}: ${message}`);
+        if (last?.logFilePath === undefined) return;
+        try {
+          appendFileSync(last.logFilePath, `\n[sandcastle] ${message}\n`);
+        } catch {
+          // A log that cannot be written must not break the run.
+        }
+      },
       pastEndTime,
     });
     if (outcome.reason === "dead-run") {
@@ -1284,7 +1462,9 @@ async function publish(
   if (local === pushed) {
     console.log(`\n${integrationBranch} is already on origin; nothing to push.`);
   } else {
-    execSync(`git push -u origin ${integrationBranch}`, { stdio: "inherit" });
+    // --no-verify: the pre-push hook would lint this checkout, not the branch;
+    // CHECK_COMMAND already linted the branch in the sandbox.
+    execSync(`git push --no-verify -u origin ${integrationBranch}`, { stdio: "inherit" });
   }
 
   const mergedIssues = resolveMergedIssues(group, integrationBranch);
@@ -1294,7 +1474,14 @@ async function publish(
         mergedIssues.map((issue) => `- ${issue.id}: ${issue.title}`).join("\n"),
       )
     : undefined;
-  const body = buildPrBody({ group, mergedIssues, blockedIssues: blocked, complete, writeup });
+  const body = buildPrBody({
+    group,
+    mergedIssues,
+    blockedIssues: blocked,
+    complete,
+    writeup,
+    implementers: { byIssue: runState.implementedBy(), fallback: CLAUDE_MODEL },
+  });
 
   const existing = sh(
     `gh pr list --head ${integrationBranch} --state open --json url --jq ".[0].url // empty"`,
@@ -1378,6 +1565,8 @@ async function workGroup(group: Group, integration: IntegrationSandbox): Promise
   let settledWithNothingToDo = false;
 
   let stoppedAtEndTime = false;
+  /** Issues the previous cycle merged, which this cycle's plan must not hold. */
+  let justMerged: string[] = [];
 
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     if (pastEndTime()) {
@@ -1394,6 +1583,14 @@ async function workGroup(group: Group, integration: IntegrationSandbox): Promise
     // whose work this run has just merged — should let its dependent join this
     // same run, not wait for the next invocation.
     ({ planned, blocked } = await planGroup(group, alreadyMerged));
+
+    const replanned = replannedAfterMerge(justMerged, planned.map((issue) => issue.id));
+    if (replanned.length > 0) {
+      throw new BranchStateError(
+        `${replanned.map((id) => `#${id}`).join(", ")} merged into ${integrationBranch} last cycle but planned again: their Done markers are not being seen there. Stopping the group rather than re-working finished issues every cycle. Check \`git log ${integrationBranch} --grep=^Sandcastle-Done:\`, then re-run Sandcastle.`,
+      );
+    }
+    justMerged = [];
 
     if (blocked.length > 0) {
       console.log(`${blocked.length} issue(s) blocked, skipped this cycle:`);
@@ -1437,6 +1634,14 @@ async function workGroup(group: Group, integration: IntegrationSandbox): Promise
       }
     }
 
+    const shared = sharedFailure(
+      settled.flatMap((outcome, i) =>
+        outcome.status === "rejected" ? [{ issue: planned[i]!.id, message: errorMessage(outcome.reason) }] : [],
+      ),
+      planned.length,
+    );
+    if (shared !== undefined) throw sharedFailureStop(shared);
+
     // "Completed" here means carrying a Done marker for this integration
     // branch — written inside workIssue once the implementer signalled and
     // the reviewer finished — not merely having produced a commit.
@@ -1467,6 +1672,7 @@ async function workGroup(group: Group, integration: IntegrationSandbox): Promise
 
     console.log(`\nMerging ${completed.length} finished branch(es):`);
     await integration.merge(completed);
+    justMerged = completed.map((issue) => issue.id);
 
     console.log("\nBranches merged into integration branch.");
   }
@@ -1494,9 +1700,59 @@ async function workGroup(group: Group, integration: IntegrationSandbox): Promise
 // The run
 // ---------------------------------------------------------------------------
 
-// `refresh` cannot collide with a group id: those are a parent issue's number
-// or `solo-<number>`.
+// `refresh` and `prune` cannot collide with a group id: those are a parent
+// issue's number or `solo-<number>`.
 const REFRESHING = REQUESTED_GROUP === "refresh";
+
+/**
+ * `prune`: delete the local Sandcastle branches whose work has shipped, with
+ * their worktrees (see prunableBranches for what counts as shipped). A branch
+ * whose worktree holds uncommitted changes is kept. Nothing on origin is
+ * touched. Exits the process.
+ */
+function pruneBranches(): never {
+  execSync(`git fetch --quiet origin ${BASE_BRANCH}`, { stdio: "inherit" });
+  // A worktree folder deleted by hand still holds its branch until git forgets it.
+  sh(`git worktree prune`);
+  const { batches, issues } = prunableBranches(REPO_CWD, {
+    batchBranches: branchesMatching("sandcastle/batch-*"),
+    issueBranches: branchesMatching("sandcastle/issue-*"),
+    mainRef: BASE_REF,
+    mergedPrHeadBranches: fetchMergedPrHeadBranches("sandcastle/batch-*"),
+  });
+  const branches = [...issues, ...batches];
+  if (branches.length === 0) {
+    console.log("No shipped Sandcastle branches. Nothing to prune.");
+    process.exit(0);
+  }
+
+  console.log(`\n${branches.length} shipped Sandcastle branch(es):\n`);
+  if (DRY_RUN) {
+    for (const branch of branches) console.log(`  ${branch}`);
+    console.log("\nSANDCASTLE_DRY_RUN=1 — listed above, nothing deleted.");
+    process.exit(0);
+  }
+
+  let kept = 0;
+  for (const branch of branches) {
+    const worktree = worktreePathOf(branch);
+    if (existsSync(worktree)) {
+      if (worktreeIsDirty(branch) || shQuiet(`git worktree remove ${worktree}`) === undefined) {
+        console.warn(`  kept ${branch}: its worktree ${worktree} has uncommitted changes or could not be removed`);
+        kept++;
+        continue;
+      }
+    }
+    sh(`git branch -D ${branch}`);
+    const issue = issueNumberOfBranch(branch);
+    if (issue !== undefined) runState.clearSession(issue);
+    console.log(`  deleted ${branch}`);
+  }
+  console.log(`\nPruned ${branches.length - kept} branch(es)${kept > 0 ? `, kept ${kept}` : ""}.`);
+  process.exit(0);
+}
+
+if (REQUESTED_GROUP === "prune") pruneBranches();
 
 const allGroups = REFRESHING ? [] : partitionIntoGroups(fetchOpenIssues());
 for (const group of allGroups) assertSafeGroupId(group.id);
@@ -1567,12 +1823,21 @@ if (DRY_RUN) {
   } else if (WAIT_FOR_QUOTA) {
     console.log("\nWaiting through quota stops, with no end time.");
   }
-  const dryGate = quotaGate(runState.readQuotaReset(), new Date(), IGNORE_QUOTA_GATE);
-  console.log(
-    dryGate.allowed
-      ? "\nQuota gate: open — a real run would start."
-      : `\nQuota gate: closed — a real run would refuse. Quota resets ${localTime(dryGate.resetAt)} (${dryGate.minutesLeft} min left).`,
-  );
+  for (const provider of QUOTA_PROVIDERS) {
+    const dryGate = quotaGate(runState.readQuotaReset(provider), new Date(), IGNORE_QUOTA_GATE);
+    console.log(
+      dryGate.allowed
+        ? `\n${PROVIDER_NAMES[provider]} quota gate: open — a real run would start.`
+        : `\n${PROVIDER_NAMES[provider]} quota gate: closed — a real run would refuse. Quota resets ${localTime(dryGate.resetAt)} (${dryGate.minutesLeft} min left).`,
+    );
+  }
+  console.log(`\nImplementer: ${IMPLEMENTER === "agy" ? `agy ${AGY_IMPLEMENTER_MODEL}` : CLAUDE_MODEL}`);
+  if (IMPLEMENTER === "agy") {
+    // The one agent call a dry run makes: a word of Gemini costs nothing next
+    // to finding out after the sandboxes are built that its quota is spent.
+    const probe = runQuotaProbe("agy", AGY_IMPLEMENTER_MODEL);
+    console.log(`\nGemini quota probe: ${describeQuotaProbe(probe)}`);
+  }
   console.log("\nReviewer model per planned issue:");
   for (const group of groups) {
     for (const issue of group.issues) {
@@ -1581,7 +1846,7 @@ if (DRY_RUN) {
         numstat === undefined
           ? "no branch yet — chosen from its diff once the implementer finishes"
           : (({ model, reason }) => `${model} (${reason})`)(
-              chooseReviewerModel(changedLines(numstat, config.lockfiles)),
+              chooseReviewerModel(changedLines(numstat, config.lockfiles, config.testFiles)),
             );
       console.log(`  #${issue.number}: ${choice}`);
     }
@@ -1682,24 +1947,28 @@ function preflightSandbox(): void {
 
 preflightSandbox();
 
-let startGate = quotaGate(runState.readQuotaReset(), new Date(), IGNORE_QUOTA_GATE);
-if (!startGate.allowed) {
+// Each provider's gate in turn, so a spent Gemini quota at startup is slept
+// through like a spent Claude one — each on its own reset, never past the end.
+for (const provider of QUOTA_PROVIDERS) {
+  const gate = quotaGate(runState.readQuotaReset(provider), new Date(), IGNORE_QUOTA_GATE);
+  if (gate.allowed) continue;
   const plan = planQuotaWait({
+    provider,
     kind: "session",
-    resetAt: startGate.resetAt,
+    resets: quotaResets(),
     now: new Date(),
     waiting: WAIT_FOR_QUOTA,
     endAt: END_AT,
   });
   if (!plan.wait) {
     console.error(
-      `\nClaude quota resets at ${localTime(startGate.resetAt)} — ${startGate.minutesLeft} minute(s) from now. Nothing was started${WAIT_FOR_QUOTA ? `, because ${plan.reason}` : ""}. Set SANDCASTLE_IGNORE_QUOTA_GATE=1 to run anyway.`,
+      `\n${PROVIDER_NAMES[provider]} quota resets at ${localTime(gate.resetAt)} — ${gate.minutesLeft} minute(s) from now. Nothing was started${WAIT_FOR_QUOTA ? `, because ${plan.reason}` : ""}. Set SANDCASTLE_IGNORE_QUOTA_GATE=1 to run anyway.`,
     );
     process.exit(1);
   }
-  await sleepUntil(plan.until, "Quota is spent.");
-  startGate = quotaGate(runState.readQuotaReset(), new Date(), IGNORE_QUOTA_GATE);
+  await sleepUntil(plan.until, `${PROVIDER_NAMES[provider]} quota is spent.`);
 }
+const startGate = quotaGate(runState.readQuotaReset("claude"), new Date(), IGNORE_QUOTA_GATE);
 
 const startBranch = sh(`git rev-parse --abbrev-ref HEAD`);
 
@@ -1757,79 +2026,162 @@ async function sleepUntil(wakeAt: Date, why: string): Promise<void> {
   }
 }
 
-const PROBE_MODEL = "claude-haiku-4-5";
+const CLAUDE_PROBE_MODEL = "claude-haiku-4-5";
 
 /**
- * One tiny Haiku call on the host, so quota spent elsewhere is caught before
- * any sandbox is paid for. Returns the run-fatal failure it found, if any.
- * A missing `claude` binary skips the probe with a warning.
+ * What a host quota probe found: the stop that ends the run, a quota that is
+ * holding, or no answer at all — an agent that isn't installed, or a call that
+ * failed for a reason the classifier doesn't name. No answer is not a clean
+ * quota, so every caller has to say which it got.
  */
-function probeQuota(): RunFatalError | undefined {
+type QuotaProbe = { kind: "stop"; stop: RunFatalError } | { kind: "clear" } | { kind: "no-answer"; why: string };
+
+/**
+ * One tiny call to `binary` on the host, so quota spent elsewhere is caught
+ * before any sandbox is paid for — Claude's probe, and `agy`'s under
+ * `--implementer agy` (#729).
+ */
+function runQuotaProbe(binary: string, model: string): QuotaProbe {
   let output: string;
+  /** What a failed call printed; undefined while the call is still fine. */
+  let printed: string | undefined;
+  // `claude` would otherwise save each probe as a session, cluttering `--resume`.
+  const args = ["-p", "Reply with the single word: ok", "--model", model];
+  if (binary === "claude") args.push("--no-session-persistence");
   try {
-    output = execFileSync("claude", ["-p", "Reply with the single word: ok", "--model", PROBE_MODEL], {
+    output = execFileSync(binary, args, {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 120_000,
     });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      console.warn("\nWarning: no `claude` binary on this machine — skipping the quota probe.");
-      return undefined;
+      return { kind: "no-answer", why: `no \`${binary}\` binary on this machine` };
     }
     const { stdout, stderr } = error as { stdout?: string; stderr?: string };
-    output = `${stdout ?? ""}\n${stderr ?? ""}\n${errorText(error)}`;
+    printed = `${stdout ?? ""}\n${stderr ?? ""}`.trim();
+    output = `${printed}\n${errorText(error)}`;
   }
   try {
     throwIfRunFatal(output);
   } catch (rethrown) {
-    return rethrown as RunFatalError;
+    return { kind: "stop", stop: rethrown as RunFatalError };
   }
-  return undefined;
+  if (printed !== undefined) {
+    // What the agent printed, not the Node stack that follows it in `output`.
+    const tail = printed.slice(-PROBE_FAILURE_CHARS) || "it printed nothing";
+    return { kind: "no-answer", why: `\`${binary}\` failed: ${tail}` };
+  }
+  return { kind: "clear" };
+}
+
+/** The stop a probe found, saying so when it could not answer at all. */
+function probeQuota(binary: string, model: string): RunFatalError | undefined {
+  const probe = runQuotaProbe(binary, model);
+  if (probe.kind === "no-answer") console.warn(`\nWarning: quota not checked — ${probe.why}.`);
+  return probe.kind === "stop" ? probe.stop : undefined;
+}
+
+/** The dry-run plan's one-line reading of a probe. */
+function describeQuotaProbe(probe: QuotaProbe): string {
+  switch (probe.kind) {
+    case "stop":
+      return probe.stop.message;
+    case "clear":
+      return "ok.";
+    case "no-answer":
+      return `not checked — ${probe.why}.`;
+  }
+}
+
+/** Every provider's saved reset, for the wait planner to pick the stopped one's from. */
+function quotaResets(): Record<QuotaProvider, Date | undefined> {
+  return { claude: runState.readQuotaReset("claude"), gemini: runState.readQuotaReset("gemini") };
+}
+
+/**
+ * When the spent Gemini quota resets and which limit it is, from `agy -p
+ * "/usage"` on the host — an `AGY_ERROR` line names neither (#732). Undefined
+ * when the output can't be read or names no spent Gemini limit.
+ */
+function readGeminiQuotaReset(): { resetAt: Date; kind: QuotaStopKind } | undefined {
+  try {
+    const usage = execFileSync("agy", ["-p", "/usage"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 120_000,
+    });
+    return parseGeminiQuotaReset(usage, new Date());
+  } catch (error) {
+    console.warn(`\nWarning: could not read Gemini's reset time from \`agy -p "/usage"\` — ${errorText(error)}`);
+    return undefined;
+  }
 }
 
 /**
  * The one quota path, shared by an agent's quota stop and the probe: record the
- * reset time and, while waiting is on, sleep until it — or, with no reset time
- * in the message, an hour at a time with a probe after each. Returns the stop
- * that ends the run, or undefined when it waited and the run should carry on.
+ * stopped provider's reset time and, while waiting is on, sleep until it — or,
+ * with no reset time known, an hour at a time with a probe of that provider
+ * after each. Returns the stop that ends the run, or undefined when it waited
+ * and the run should carry on.
  */
 async function handleQuotaStop(stop: RunFatalError): Promise<RunFatalError | undefined> {
   let current = stop;
   while (current.kind === "quota") {
-    if (current.resetAt) runState.recordQuotaReset(current.resetAt);
+    const provider = current.provider;
+    let kind = current.quotaStop ?? "session";
+    if (provider === "gemini") {
+      const reset = readGeminiQuotaReset();
+      if (reset) {
+        runState.recordQuotaReset("gemini", reset.resetAt);
+        kind = reset.kind;
+      }
+    } else if (current.resetAt) {
+      runState.recordQuotaReset("claude", current.resetAt);
+    }
     const plan = planQuotaWait({
-      kind: current.quotaStop ?? "session",
-      resetAt: current.resetAt,
+      provider,
+      kind,
+      resets: quotaResets(),
       now: new Date(),
       waiting: WAIT_FOR_QUOTA,
       endAt: END_AT,
     });
+    const name = PROVIDER_NAMES[provider];
     if (!plan.wait) {
-      if (WAIT_FOR_QUOTA) console.error(`\nNot waiting for the quota: ${plan.reason}.`);
+      if (WAIT_FOR_QUOTA) console.error(`\nNot waiting for the ${name} quota: ${plan.reason}.`);
       return current;
     }
     if (!plan.recheck) {
-      await sleepUntil(plan.until, `Quota stop (reset plus ${QUOTA_WAIT_MARGIN_MS / 60_000} minutes).`);
+      await sleepUntil(plan.until, `${name} quota stop (reset plus ${QUOTA_WAIT_MARGIN_MS / 60_000} minutes).`);
       return undefined;
     }
-    await sleepUntil(plan.until, "Quota stop with no reset time — checking again in an hour.");
-    const again = probeQuota();
+    await sleepUntil(plan.until, `${name} quota stop with no reset time — checking again in an hour.`);
+    const again =
+      provider === "gemini" ? probeQuota("agy", AGY_IMPLEMENTER_MODEL) : probeQuota("claude", CLAUDE_PROBE_MODEL);
     if (!again) return undefined;
     current = again;
   }
   return current;
 }
 
-if (shouldProbeQuota(startGate, runState.readQuotaReset(), new Date(), DRY_RUN)) {
-  const probeStop = probeQuota();
+if (shouldProbeQuota(startGate, runState.readQuotaReset("claude"), new Date(), DRY_RUN)) {
+  const probeStop = probeQuota("claude", CLAUDE_PROBE_MODEL);
   if (probeStop) fatal = await handleQuotaStop(probeStop);
+}
+
+// A spent Gemini quota has to stop the run before any sandbox is built too,
+// so the implementer's own probe follows Claude's (#729).
+if (!fatal && IMPLEMENTER === "agy") {
+  const agyProbeStop = probeQuota("agy", AGY_IMPLEMENTER_MODEL);
+  if (agyProbeStop) fatal = await handleQuotaStop(agyProbeStop);
 }
 
 const RESUME_ADVICE: Record<Exclude<FailureKind, "local">, string> = {
   quota: "Re-run Sandcastle when your quota resets.",
   auth: "Log the agent in, then re-run Sandcastle.",
   network: "Check the sandbox's connectivity, then re-run Sandcastle.",
+  shared: "Fix what the failure above names — the machine, a login or the quota, since every issue met it — then re-run Sandcastle.",
 };
 
 /**
@@ -1862,7 +2214,8 @@ async function refreshBatchPrs(branches: string[]): Promise<never> {
       } finally {
         await integration.close();
       }
-      execSync(`git push origin ${branch}`, { stdio: "inherit" });
+      // --no-verify for the same reason as the integration-branch push.
+      execSync(`git push --no-verify origin ${branch}`, { stdio: "inherit" });
       refreshed++;
     } catch (error) {
       let stop = runFatalStop(error);
@@ -1974,8 +2327,10 @@ if (fatal) {
   }
 
   console.error(`\n${RESUME_ADVICE[fatal.kind]} It will resume where it stopped.`);
-  if (fatal.kind === "quota" && fatal.resetAt) {
-    console.error(`Quota resets at ${localTime(fatal.resetAt)}.`);
+  // A Gemini stop's reset came from `agy -p "/usage"` into the run state, not from its message.
+  const resetAt = fatal.kind === "quota" ? (fatal.resetAt ?? runState.readQuotaReset(fatal.provider)) : undefined;
+  if (resetAt && resetAt.getTime() > Date.now()) {
+    console.error(`${PROVIDER_NAMES[fatal.provider]} quota resets at ${localTime(resetAt)}.`);
   }
   reportOutcome("interrupted");
   process.exit(2);

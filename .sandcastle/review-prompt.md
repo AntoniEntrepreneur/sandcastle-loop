@@ -18,6 +18,15 @@ The issue, its comments and its parent spec. Do not fetch them with `gh`.
 
 !`git log {{INTEGRATION_BRANCH}}..{{BRANCH}} --oneline`
 
+## Check
+
+The full suite belongs to the orchestrator. It passed `{{CHECK_COMMAND}}` on
+this branch before the review started, and it runs the formatter and
+`{{CHECK_COMMAND}}` again after every change you make. Do not run the full
+suite, the linter or the formatter yourself.
+
+{{CHECK_FAILURE}}
+
 # REVIEW PROCESS
 
 1. **Understand the change**: Read the issue, then the diff and commits above.
@@ -54,10 +63,10 @@ The issue, its comments and its parent spec. Do not fetch them with `gh`.
 If you find improvements to make:
 
 1. Make the changes directly on this branch
-2. Run targeted tests for what you touched; the orchestrator runs the full suite afterwards
+2. Run the targeted test files for the code you changed, and nothing else
 3. Commit describing the refinements
 
-If the code is already clean and well-structured, do nothing.
+If the code is already clean and well-structured, do nothing, and run no tests.
 
 Once complete, output <promise>COMPLETE</promise>.
 

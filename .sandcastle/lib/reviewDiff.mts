@@ -7,12 +7,18 @@ export const OPUS_LINE_THRESHOLD = 200;
 /** Estimated tokens above which the reviewer gets a `--stat` summary. */
 export const FULL_DIFF_TOKEN_LIMIT = 15_000;
 
-/** Added plus removed lines in `git diff --numstat` output, `lockfiles` ignored. */
-export function changedLines(numstat: string, lockfiles: string[]): number {
+/**
+ * Added plus removed lines in `git diff --numstat` output, `lockfiles` and paths
+ * matching `testFiles` ignored: tests are cheap to review, and counting them
+ * would send a small, well-tested change to Opus.
+ */
+export function changedLines(numstat: string, lockfiles: string[], testFiles: readonly RegExp[] = []): number {
   let total = 0;
   for (const line of numstat.split("\n")) {
-    const [added, removed, path] = line.split("\t");
-    if (path === undefined || lockfiles.includes(path.trim())) continue;
+    const [added, removed, rawPath] = line.split("\t");
+    if (rawPath === undefined) continue;
+    const path = rawPath.trim();
+    if (lockfiles.includes(path) || testFiles.some((pattern) => pattern.test(path))) continue;
     total += (Number(added) || 0) + (Number(removed) || 0);
   }
   return total;

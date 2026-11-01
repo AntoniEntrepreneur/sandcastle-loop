@@ -7,6 +7,10 @@ export interface UsageRow {
   role: string;
   inputTokens: number;
   outputTokens: number;
+  /** Set for `agy` rows; unset for Claude's, which counts thinking as output. */
+  thinkingTokens?: number;
+  /** Prompt tokens served from cache, kept out of `inputTokens` because they cost a fraction of it. */
+  cacheReadTokens?: number;
 }
 
 /**
@@ -21,8 +25,8 @@ export function sessionUsage(
   jsonl: string,
   sinceMs: number,
   counted: Set<string>,
-): Pick<UsageRow, "inputTokens" | "outputTokens"> {
-  const total = { inputTokens: 0, outputTokens: 0 };
+): Required<Pick<UsageRow, "inputTokens" | "outputTokens" | "cacheReadTokens">> {
+  const total = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 };
   for (const line of jsonl.split("\n")) {
     if (!line.startsWith("{")) continue;
     let entry;
@@ -36,8 +40,8 @@ export function sessionUsage(
     if (entry.type !== "assistant" || typeof id !== "string" || !usage) continue;
     if (counted.has(id) || !(Date.parse(entry.timestamp) >= sinceMs)) continue;
     counted.add(id);
-    total.inputTokens +=
-      (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0);
+    total.inputTokens += (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);
+    total.cacheReadTokens += usage.cache_read_input_tokens ?? 0;
     total.outputTokens += usage.output_tokens ?? 0;
   }
   return total;
@@ -46,25 +50,31 @@ export function sessionUsage(
 /** Logs older than this are deleted at the start of a run. */
 export const LOG_RETENTION_DAYS = 30;
 
-/** Per issue and role (rows merged), with a totals line. */
+/**
+ * One row per step, numbered within its issue and role so a resumed step reads
+ * on its own (#810), with a totals line. The number counts recorded rows across
+ * the whole run, so a step that recorded no usage, or a later cycle, shifts it
+ * from the issue loop's own step count. A Claude row leaves Thinking at zero:
+ * Claude counts thinking as Output, so only an `agy` row fills all four
+ * columns (#731).
+ */
 export function formatUsageTable(rows: UsageRow[]): string {
   if (rows.length === 0) return "No agent usage was recorded this run.";
 
-  const merged = new Map<string, UsageRow>();
-  for (const row of rows) {
-    const key = `${row.issue}\0${row.role}`;
-    const sum = merged.get(key) ?? { ...row, inputTokens: 0, outputTokens: 0 };
-    sum.inputTokens += row.inputTokens;
-    sum.outputTokens += row.outputTokens;
-    merged.set(key, sum);
-  }
-  const body = [...merged.values()].map((r) => [r.issue, r.role, String(r.inputTokens), String(r.outputTokens)]);
-  const sum = (pick: (r: UsageRow) => number) => String([...merged.values()].reduce((n, r) => n + pick(r), 0));
-  const header = ["Issue", "Role", "Input", "Output"];
-  const total = ["Total", "", sum((r) => r.inputTokens), sum((r) => r.outputTokens)];
+  const counts = (r: UsageRow) => [r.inputTokens, r.outputTokens, r.thinkingTokens ?? 0, r.cacheReadTokens ?? 0];
+  const steps = new Map<string, number>();
+  const header = ["Issue", "Role", "Step", "Input", "Output", "Thinking", "Cache-read"];
+  const body = rows.map((r) => {
+    const key = `${r.issue}\0${r.role}`;
+    const step = (steps.get(key) ?? 0) + 1;
+    steps.set(key, step);
+    return [r.issue, r.role, String(step), ...counts(r).map(String)];
+  });
+  const totals = rows.reduce((running, r) => running.map((n, i) => n + counts(r)[i]!), [0, 0, 0, 0]);
+  const total = ["Total", "", "", ...totals.map(String)];
 
   const all = [header, ...body, total];
-  const widths = [0, 1, 2, 3].map((i) => Math.max(...all.map((l) => l[i]!.length)));
+  const widths = header.map((_, i) => Math.max(...all.map((l) => l[i]!.length)));
   const fmt = (l: string[]) =>
     l
       .map((cell, i) => (i < 2 ? cell.padEnd(widths[i]!) : cell.padStart(widths[i]!)))

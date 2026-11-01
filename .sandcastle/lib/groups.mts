@@ -145,9 +145,10 @@ export function issueNumberOfBranch(branch: string): number | undefined {
  *
  * Quota exhaustion and a broken login kill every group equally, so continuing
  * only burns container starts. Anything else is the group's own problem and
- * the next group deserves its turn.
+ * the next group deserves its turn. "shared" is never read from text: it is
+ * every issue of a cycle failing alike (see sharedFailure).
  */
-export type FailureKind = "quota" | "auth" | "network" | "local";
+export type FailureKind = "quota" | "auth" | "network" | "shared" | "local";
 
 const QUOTA_PATTERNS = [
   /usage limit reached/i,
@@ -162,6 +163,10 @@ const QUOTA_PATTERNS = [
   // "You've hit your weekly limit · resets 2am (UTC)" — seen in an implementer
   // log; unmatched, it failed one group and let the run start the next.
   /weekly limit/i,
+  // "You've hit your 5-hour limit · resets 1:20am (UTC)" — the session stop's
+  // newer wording. Unmatched, an overnight run never slept: it failed every
+  // issue as local for six cycles and opened the PR hours before the reset.
+  /5-hour limit/i,
 ];
 
 // A machine that cannot reach the API will not be able to reach it on the next
@@ -189,6 +194,63 @@ export function classifyFailure(text: string): FailureKind {
   if (AUTH_PATTERNS.some((pattern) => pattern.test(text))) return "auth";
   if (NETWORK_PATTERNS.some((pattern) => pattern.test(text))) return "network";
   return "local";
+}
+
+// `agy` reports its own failures on a line of their own, e.g. "AGY_ERROR:
+// Your AI credits balance is too low to continue." Anchored to the start of a
+// line, so an agent's output that merely quotes one — a diff or a test failure
+// naming this repo's own fixtures — is not read as `agy` failing (#729).
+const AGY_ERROR_LINE = /^AGY_ERROR\b.*/m;
+
+/** The `AGY_ERROR` line `text` carries, if any — `agy`'s own error channel. */
+export function agyErrorLine(text: string): string | undefined {
+  return text.match(AGY_ERROR_LINE)?.[0];
+}
+
+/**
+ * What an agent said, out of stdout that may be `agy`'s event stream. That
+ * stream carries every tool's output (`tool_info.output`), so a file the agent
+ * merely read — this repo's own quota patterns, say — would read as a spent
+ * quota. For an `agy` stream, only its final `result` (response and error)
+ * and its non-JSON lines (`AGY_ERROR`) count; anything else is returned as-is.
+ */
+export function agentSaidText(stdout: string): string {
+  const lines = stdout.split("\n");
+  if (!lines.some((line) => line.startsWith('{"event":'))) return stdout;
+  const said: string[] = [];
+  for (const line of lines) {
+    if (!line.startsWith("{")) {
+      said.push(line);
+      continue;
+    }
+    try {
+      const { event, result } = JSON.parse(line) as {
+        event?: string;
+        result?: { response?: unknown; error?: unknown };
+      };
+      if (event !== "result") continue;
+      for (const part of [result?.response, result?.error]) {
+        if (typeof part === "string") said.push(part);
+      }
+    } catch {
+      // A truncated JSON line carries nothing to judge.
+    }
+  }
+  return said.join("\n");
+}
+
+// `agy`'s own credit/quota wording on an AGY_ERROR line (e.g. "Your AI
+// credits balance is too low to continue."), distinct from Claude's
+// QUOTA_PATTERNS above — "credits balance" there, not "credit balance".
+const AGY_QUOTA_PATTERNS = [/credits balance is too low/i, /insufficient credits/i, /out of credits/i];
+
+/**
+ * Whether an AGY_ERROR line names a spent Gemini quota or credits balance, as
+ * opposed to any other `agy` failure (a model or agent error), which is the
+ * group's own dead run rather than run-fatal.
+ */
+export function isAgyQuotaStop(line: string): boolean {
+  return AGY_QUOTA_PATTERNS.some((pattern) => pattern.test(line));
 }
 
 /** Quota, auth and network failures end the whole run; a local one ends only its group. */
@@ -320,6 +382,21 @@ export function withTimeLimit(command: string): string {
 }
 
 /**
+ * The end of each stream, joined by a newline, within `tailChars`. The streams
+ * are captured apart, so their interleaving is lost; keeping the end of both
+ * stops noisy stderr from pushing a stdout failure out of the tail.
+ */
+function balancedTail(stdout: string, stderr: string, tailChars: number): string {
+  if (stdout.length + 1 + stderr.length <= tailChars) return `${stdout}\n${stderr}`;
+  const budget = Math.max(tailChars - 1, 0);
+  const stderrShare = Math.min(stderr.length, Math.ceil(budget / 2));
+  const stdoutShare = Math.min(stdout.length, budget - stderrShare);
+  const stderrKept = Math.min(stderr.length, budget - stdoutShare);
+  const end = (text: string, n: number) => (n > 0 ? text.slice(-n) : "");
+  return `${end(stdout, stdoutShare)}\n${end(stderr, stderrKept)}`;
+}
+
+/**
  * The output tail to report for a finished check, or undefined when it was
  * green. A timeout (exit 124) is red, and the report says so.
  */
@@ -330,7 +407,7 @@ export function checkFailureTail(
   tailChars: number,
 ): string | undefined {
   if (exitCode === 0) return undefined;
-  const tail = `${stdout}\n${stderr}`.slice(-tailChars);
+  const tail = balancedTail(stdout, stderr, tailChars);
   if (exitCode !== TIMEOUT_EXIT_CODE) return tail;
   return `The check timed out after ${CHECK_TIME_LIMIT_SECONDS / 60} minutes and was killed.\n\n${tail}`;
 }
@@ -468,6 +545,12 @@ export function buildPrTitle(group: Group, mergedIssues: number): string {
  * `writeup` is the reviewer-facing body the PR writer drafted with the `pr`
  * skill. It sits under the Sandcastle marker; the `Closes` lines stay generated
  * here, because which issues a merge closes is not the writer's call.
+ *
+ * `implementers` adds one "implemented by" line per merged issue (#731), so a
+ * reviewer can tell which work to scrutinise: a batch spans runs, and each run
+ * can pick a different implementer. `byIssue` holds the label recorded for an
+ * issue, `fallback` names the rest — an issue merged before a run recorded its
+ * implementer has no entry. Omitted, the lines are left out entirely.
  */
 export function buildPrBody(options: {
   group: Group;
@@ -475,8 +558,9 @@ export function buildPrBody(options: {
   blockedIssues: { id: string; title: string; blockedBy: number[] }[];
   complete: boolean;
   writeup?: string;
+  implementers?: { byIssue: Record<string, string>; fallback: string };
 }): string {
-  const { group, mergedIssues, blockedIssues, complete, writeup } = options;
+  const { group, mergedIssues, blockedIssues, complete, writeup, implementers } = options;
   const solo = soloIssueOf(group.id);
   const lines = [
     // A batch of one is not a batch, and there is no group label to name: a
@@ -492,6 +576,12 @@ export function buildPrBody(options: {
 
   if (mergedIssues.length > 0) {
     lines.push(...mergedIssues.map((i) => `Closes #${i.id}: ${i.title}`));
+    if (implementers !== undefined) {
+      lines.push("");
+      lines.push(
+        ...mergedIssues.map((i) => `#${i.id}: implemented by ${implementers.byIssue[i.id] ?? implementers.fallback}`),
+      );
+    }
   } else {
     lines.push(
       "Carried forward from an earlier interrupted run; see the commits on this branch.",
@@ -544,4 +634,36 @@ export function isSettledWithNothingToDo(
     outcomes.length > 0 &&
     outcomes.every((o) => !o.failed && o.commits === 0 && o.completed)
   );
+}
+
+/**
+ * The message every planned issue failed with, when all of a cycle's issues
+ * failed alike, or undefined.
+ *
+ * The backstop behind classifyFailure() at cycle level, as isDeadRun is at step
+ * level: it needs no known wording. Independent issues failing identically
+ * points at the machine, the login or the quota, not at the issues, so another
+ * cycle would fail the same way (2026-10-28: five cycles lost to a quota message
+ * no pattern matched). One issue proves nothing, so it takes two. Each message
+ * has its own issue number masked before comparing.
+ */
+export function sharedFailure(
+  failures: { issue: string; message: string }[],
+  planned: number,
+): string | undefined {
+  if (planned < 2 || failures.length !== planned) return undefined;
+  const masked = failures.map(({ issue, message }) =>
+    message.replace(new RegExp(`\\b${issue}\\b`, "g"), "<issue>"),
+  );
+  return masked.every((message) => message === masked[0]) ? failures[0]!.message : undefined;
+}
+
+/**
+ * Issues merged last cycle that this cycle planned again. A merge carries the
+ * issue's Done marker, so the next plan should drop it; any that come back
+ * mean the markers are going unseen, and every further cycle would re-work
+ * finished issues (#855).
+ */
+export function replannedAfterMerge(justMerged: readonly string[], planned: readonly string[]): string[] {
+  return planned.filter((id) => justMerged.includes(id));
 }

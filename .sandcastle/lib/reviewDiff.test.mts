@@ -46,6 +46,14 @@ test("binary files (dashes) count as zero", () => {
   assert.equal(changedLines("-\t-\tlogo.png\n4\t1\ta.ts", LOCKFILES), 5);
 });
 
+/** Pins that a branch of mostly tests no longer reaches Opus on its test lines. */
+test("test files do not count toward the changed lines", () => {
+  const numstat = ["80\t0\tbackend/topic.py", "150\t0\ttests/test_topic.py", "40\t2\tfrontend/test/page.test.tsx"].join(
+    "\n",
+  );
+  assert.equal(changedLines(numstat, LOCKFILES, [/^tests\//, /\.test\.tsx?$/]), 80);
+});
+
 /** Pins that tokens are estimated at four characters each. */
 test("tokens are estimated at four characters each", () => {
   assert.equal(estimateTokens("x".repeat(401)), 101);
