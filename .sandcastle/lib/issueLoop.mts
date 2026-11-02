@@ -4,14 +4,17 @@
 // the loop is tested with fakes and the orchestrator only wires real functions in.
 
 import {
+  agentSaidText,
+  agyErrorLine,
   checkFailureTail,
   classifyFailure,
+  isAgyQuotaStop,
   isDeadRun,
   isRunFatal,
   parseQuotaReset,
   type FailureKind,
 } from "./groups.mts";
-import { quotaStopKind, type QuotaStopKind } from "./overnight.mts";
+import { quotaStopKind, type QuotaProvider, type QuotaStopKind } from "./overnight.mts";
 
 /** Fix-and-recheck rounds allowed after a red check, per role. */
 export const MAX_CHECK_ROUNDS = 3;
@@ -24,7 +27,11 @@ const FATAL_REASONS: Record<Exclude<FailureKind, "local">, string> = {
   quota: "Claude usage exhausted",
   auth: "Agent authentication failed",
   network: "Cannot reach the API from inside the sandbox",
+  shared: "Every issue in the cycle failed the same way",
 };
+
+/** The reason a Gemini quota stop reports, in place of FATAL_REASONS.quota. */
+const GEMINI_QUOTA_REASON = "Gemini quota spent — re-run when it resets";
 
 export class RunFatalError extends Error {
   readonly kind: Exclude<FailureKind, "local">;
@@ -32,27 +39,51 @@ export class RunFatalError extends Error {
   readonly resetAt: Date | undefined;
   /** For a quota stop: which limit, read from the whole text rather than the trimmed detail. */
   readonly quotaStop: QuotaStopKind | undefined;
+  /** Whose quota or agent stopped: which reset clock to wait on, and which agent to re-probe. */
+  readonly provider: QuotaProvider;
 
   constructor(
     kind: Exclude<FailureKind, "local">,
     detail: string,
-    resetAt?: Date,
-    quotaStop?: QuotaStopKind,
+    options: {
+      resetAt?: Date;
+      quotaStop?: QuotaStopKind;
+      /** Defaults to Claude, which runs every role but an `agy` implementer. */
+      provider?: QuotaProvider;
+      /** Replaces FATAL_REASONS[kind], which names Claude. */
+      reason?: string;
+    } = {},
   ) {
-    super(`${FATAL_REASONS[kind]} — stopping the run. (${detail})`);
+    super(`${options.reason ?? FATAL_REASONS[kind]} — stopping the run. (${detail})`);
     this.kind = kind;
-    this.resetAt = resetAt;
-    this.quotaStop = quotaStop;
+    this.resetAt = options.resetAt;
+    this.quotaStop = options.quotaStop;
+    this.provider = options.provider ?? "claude";
   }
 }
 
 /** Rethrow as fatal when the text names a failure that would kill every group. */
-export function throwIfRunFatal(text: string): void {
+export function throwIfRunFatal(stdout: string): void {
+  const text = agentSaidText(stdout);
+  const agyError = agyErrorLine(text);
+  if (agyError) {
+    // A non-quota AGY_ERROR (a model or agent error) is the group's own dead
+    // run, like any other implementer failure — not run-fatal (#729).
+    if (!isAgyQuotaStop(agyError)) return;
+    // The line names no reset and no limit: the orchestrator reads both from
+    // `agy -p "/usage"` (#732), so "session" only stands until it does.
+    throw new RunFatalError("quota", agyError.slice(0, 200), {
+      quotaStop: "session",
+      provider: "gemini",
+      reason: GEMINI_QUOTA_REASON,
+    });
+  }
   const kind = classifyFailure(text);
   if (isRunFatal(kind)) {
-    const resetAt = kind === "quota" ? parseQuotaReset(text, new Date()) : undefined;
-    const quotaStop = kind === "quota" ? quotaStopKind(text) : undefined;
-    throw new RunFatalError(kind, text.slice(0, 200), resetAt, quotaStop);
+    throw new RunFatalError(kind, text.slice(0, 200), {
+      resetAt: kind === "quota" ? parseQuotaReset(text, new Date()) : undefined,
+      quotaStop: kind === "quota" ? quotaStopKind(text) : undefined,
+    });
   }
 }
 
@@ -112,7 +143,7 @@ export type IssueLoopPorts = {
     model?: string;
     /** Continue this saved session (implementer only). */
     resumeSessionId?: string;
-    /** Failure context a cold implementer start must be told, e.g. a red check's tail. */
+    /** Failure context a cold start must be told, e.g. a red check's tail. */
     extraPrompt?: string;
   }): Promise<RunResult>;
   /** Continue the most recent run's session with a short prompt. */
@@ -129,8 +160,15 @@ export type IssueLoopPorts = {
   /** Forget the saved session. */
   clearSession(): void;
   abortSignal: AbortSignal;
+  /** The tree id the check would test, or undefined when the worktree is dirty. */
+  cleanTree(): string | undefined;
+  /** Whether the check has already passed on this tree, in any sandbox or run. */
+  isGreenTree(tree: string): boolean;
+  recordGreenTree(tree: string): void;
   /** Picked when the reviewer starts, from the branch's diff by then. */
   reviewerModel(): { model: string; reason: string };
+  /** Whether the branch differs from the integration branch at all; with no diff there is nothing to review. */
+  hasChanges(): boolean;
 };
 
 export type IssueLoopOptions = {
@@ -159,17 +197,29 @@ const fixPrompt = (tail: string) =>
 /**
  * Run the formatter, commit what it changed, then the full check. Returns the
  * output tail when the check is red (a timeout counts as red), undefined when green.
+ * A tree the check already passed is not checked again — most often a reviewer
+ * that changed nothing after the implementer's green check. The result is
+ * logged against `after`, the run it followed, so a log shows which step failed (#810).
  */
 async function formatAndCheck(
   ports: IssueLoopPorts,
   options: IssueLoopOptions,
+  after: string,
 ): Promise<string | undefined> {
   if (options.formatCommand !== undefined) {
     await ports.exec(options.formatCommand);
     ports.saveWorktree("formatted");
   }
+  const tree = ports.cleanTree();
+  if (tree !== undefined && ports.isGreenTree(tree)) {
+    options.log?.(`Check after ${after} skipped — this exact tree already passed it.`);
+    return undefined;
+  }
   const result = await ports.exec(options.checkCommand);
-  return checkFailureTail(result.exitCode, result.stdout, result.stderr, CHECK_TAIL_CHARS);
+  const tail = checkFailureTail(result.exitCode, result.stdout, result.stderr, CHECK_TAIL_CHARS);
+  if (tail === undefined && tree !== undefined) ports.recordGreenTree(tree);
+  options.log?.(tail === undefined ? `Check after ${after} passed.` : `Check after ${after} failed:\n${tail}`);
+  return tail;
 }
 
 /**
@@ -256,7 +306,7 @@ export async function runIssueLoop(
 
       if (result.completed) {
         ports.abortSignal.throwIfAborted();
-        const tail = await formatAndCheck(ports, options);
+        const tail = await formatAndCheck(ports, options, `step ${step}`);
         if (tail !== undefined) {
           // Each fix round is a step, so it counts against maxSteps.
           if (++checkRounds > MAX_CHECK_ROUNDS) {
@@ -267,6 +317,13 @@ export async function runIssueLoop(
           continue;
         }
 
+        if (!ports.hasChanges()) {
+          // A reviewer of an empty diff costs as much as any other and can find nothing.
+          log("No changes against the integration branch — no reviewer needed.");
+          ports.writeDone();
+          ports.clearSession();
+          return { commits, completed: true };
+        }
         if (pastEndTime()) {
           log("End time reached — the reviewer starts on the next run.");
           return { commits, completed: false, reason: "end-time" };
@@ -279,7 +336,11 @@ export async function runIssueLoop(
         ports.saveWorktree("iteration-ended");
         for (let round = 0; ; round++) {
           ports.abortSignal.throwIfAborted();
-          const reviewTail = await formatAndCheck(ports, options);
+          const reviewTail = await formatAndCheck(
+            ports,
+            options,
+            round === 0 ? "the reviewer" : `the reviewer's fix round ${round}`,
+          );
           if (reviewTail === undefined) break;
           if (round >= MAX_CHECK_ROUNDS) {
             log("Check still red after the reviewer's three fix rounds — leaving the branch unfinished.");
@@ -291,7 +352,7 @@ export async function runIssueLoop(
           }
           review = review.resumable
             ? await ports.resumeSession(fixPrompt(reviewTail))
-            : await ports.startRun({ role: "reviewer", model: reviewer.model });
+            : await ports.startRun({ role: "reviewer", model: reviewer.model, extraPrompt: fixPrompt(reviewTail) });
           commits.push(...review.commits);
           throwIfRunFatal(review.stdout);
           ports.saveWorktree("iteration-ended");

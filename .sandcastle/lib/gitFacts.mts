@@ -16,21 +16,39 @@ import { execFileSync } from "node:child_process";
 
 import { parseDoneTrailers, type DoneMarker } from "./groups.mts";
 
+// Node's default is 1 MiB, which a batch branch's log outgrows (#855).
+const MAX_BUFFER = 256 * 1024 * 1024;
+
 /** Run a git command in `cwd` and return its trimmed stdout. */
 function git(cwd: string, args: string[]): string {
-  return execFileSync("git", args, { cwd, encoding: "utf-8" }).trim();
+  return execFileSync("git", args, { cwd, encoding: "utf-8", maxBuffer: MAX_BUFFER }).trim();
 }
 
-/** Run a git command in `cwd`, returning its trimmed stdout or undefined if it failed. */
+/**
+ * Whether a thrown exec error is git answering — it ran and exited non-zero —
+ * rather than git failing to run or being killed. Only an answer may be read
+ * as "no": #855's swallowed ENOBUFS read as "no Done markers" and re-worked
+ * every finished issue for six cycles.
+ */
+export function gitAnswered(error: unknown): boolean {
+  return typeof (error as { status?: unknown } | null)?.status === "number";
+}
+
+/**
+ * Run a git command in `cwd`, returning its trimmed stdout, or undefined when
+ * git answered with a non-zero exit. Throws when git could not run at all.
+ */
 function gitQuiet(cwd: string, args: string[]): string | undefined {
   try {
     return execFileSync("git", args, {
       cwd,
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "ignore"],
+      maxBuffer: MAX_BUFFER,
     }).trim();
-  } catch {
-    return undefined;
+  } catch (error) {
+    if (gitAnswered(error)) return undefined;
+    throw error;
   }
 }
 
@@ -124,7 +142,10 @@ export function markDone(
 /** Every Done marker reachable from `ref`, parsed from its trailers. */
 function doneMarkersOn(cwd: string, ref: string): DoneMarker[] {
   if (!branchExists(cwd, ref)) return [];
-  const raw = gitQuiet(cwd, ["log", ref, "--format=%B\x02"]);
+  // Only marker commits: the whole log of a batch that has merged main runs
+  // past execFileSync's 1 MiB buffer, and the swallowed ENOBUFS read as "no
+  // markers", so every cycle re-worked issues already done.
+  const raw = gitQuiet(cwd, ["log", ref, "--grep=^Sandcastle-Done:", "--format=%B\x02"]);
   if (!raw) return [];
 
   return raw
@@ -218,26 +239,32 @@ export function unfinishedBranches(
  * A merge an interrupted agent left half-resolved is aborted first. Its
  * branch is not yet an ancestor, so it is still in `branches` and is simply
  * merged again.
+ *
+ * `conflictFiles` names the paths each conflicted branch left unmerged, read
+ * before the abort, so a log shows which files keep sending merges to an agent.
  */
 export function mergeEach(
   worktreeCwd: string,
   branches: readonly string[],
-): { merged: string[]; conflicted: string[] } {
+): { merged: string[]; conflicted: string[]; conflictFiles: Record<string, string[]> } {
   if (gitQuiet(worktreeCwd, ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]) !== undefined) {
     gitQuiet(worktreeCwd, ["merge", "--abort"]);
   }
 
   const merged: string[] = [];
   const conflicted: string[] = [];
+  const conflictFiles: Record<string, string[]> = {};
   for (const branch of branches) {
     if (gitQuiet(worktreeCwd, ["merge", "--no-ff", "--no-edit", branch]) !== undefined) {
       merged.push(branch);
     } else {
+      const unmerged = gitQuiet(worktreeCwd, ["diff", "--name-only", "--diff-filter=U"]) ?? "";
+      conflictFiles[branch] = unmerged.split("\n").filter(Boolean);
       gitQuiet(worktreeCwd, ["merge", "--abort"]);
       conflicted.push(branch);
     }
   }
-  return { merged, conflicted };
+  return { merged, conflicted, conflictFiles };
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +308,33 @@ export function isBatchBranchShipped(
 ): boolean {
   if (mergedPrHeadBranches.includes(branch)) return true;
   return isAncestorOf(cwd, branch, mainRef);
+}
+
+/**
+ * The local branches safe to delete: batch branches that shipped, and issue
+ * branches whose every commit is on `mainRef` or on one of those shipped
+ * batches. A squash merge leaves an issue branch an ancestor of its batch but
+ * never of main, so the batch is what proves its work shipped. Anything with
+ * a commit nowhere shipped is kept.
+ */
+export function prunableBranches(
+  cwd: string,
+  options: {
+    batchBranches: readonly string[];
+    issueBranches: readonly string[];
+    mainRef: string;
+    mergedPrHeadBranches: readonly string[];
+  },
+): { batches: string[]; issues: string[] } {
+  const { mainRef, mergedPrHeadBranches } = options;
+  const batches = options.batchBranches.filter((branch) =>
+    isBatchBranchShipped(cwd, branch, mainRef, mergedPrHeadBranches),
+  );
+  const shippedRefs = [mainRef, ...batches];
+  const issues = options.issueBranches.filter((branch) =>
+    shippedRefs.some((ref) => isAncestorOf(cwd, branch, ref)),
+  );
+  return { batches, issues };
 }
 
 // ---------------------------------------------------------------------------
@@ -338,4 +392,16 @@ export function catchUpWithRemote(cwd: string, branch: string, remoteRef: string
     git(cwd, ["update-ref", `refs/heads/${branch}`, remoteRef, old]);
   }
   return "fast-forwarded";
+}
+
+/**
+ * HEAD's tree id in `cwd`, or undefined when the worktree holds anything
+ * uncommitted (or git fails). The check's verdict belongs to a tree, so this is
+ * the key a green result is remembered by; a dirty worktree gets none because
+ * the check would test files no tree records.
+ */
+export function cleanTree(cwd: string): string | undefined {
+  const status = gitQuiet(cwd, ["status", "--porcelain"]);
+  if (status === undefined || status.length > 0) return undefined;
+  return gitQuiet(cwd, ["rev-parse", "HEAD^{tree}"]);
 }

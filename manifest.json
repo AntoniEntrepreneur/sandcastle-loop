@@ -1,10 +1,12 @@
 {
   "engineVersion": "0.12.0",
-  "sourceCommit": "179e3b47b6db1aac09c4ecec3852d19f41f5adbe",
+  "sourceCommit": "33744af4a0c0d0d421c5f9fa3cc31329b94287be",
   "files": [
     ".sandcastle/.gitignore",
     ".sandcastle/export.mts",
     ".sandcastle/implement-prompt.md",
+    ".sandcastle/lib/antigravity.mts",
+    ".sandcastle/lib/antigravity.test.mts",
     ".sandcastle/lib/exportPlan.mts",
     ".sandcastle/lib/exportPlan.test.mts",
     ".sandcastle/lib/gitFacts.mts",

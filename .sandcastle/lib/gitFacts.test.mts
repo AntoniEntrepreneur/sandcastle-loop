@@ -14,13 +14,16 @@ import { join } from "node:path";
 import {
   catchUpWithRemote,
   doneIssues,
+  gitAnswered,
   isBatchBranchShipped,
   isBehind,
   isStale,
   markDone,
   mergeEach,
+  prunableBranches,
   readyToMerge,
   saveWorktree,
+  cleanTree,
   unfinishedBranches,
 } from "./gitFacts.mts";
 
@@ -76,6 +79,23 @@ test("a branch with agent commits but no Done marker is unfinished, not ready to
     assert.deepEqual(unfinishedBranches(dir, "integration", branches), ["sandcastle/issue-1"]);
     assert.deepEqual(readyToMerge(dir, "integration", branches), []);
     assert.deepEqual(doneIssues(dir, "integration"), []);
+  } finally {
+    cleanup();
+  }
+});
+
+/** Pins that markers are still read once the branch's whole log passes Node's 1 MiB exec buffer. */
+test("Done markers are found on a branch whose full log is over 1 MiB", () => {
+  const { dir, cleanup } = makeRepo();
+  try {
+    const message = join(dir, ".git", "LONG_MESSAGE");
+    writeFileSync(message, `long history\n\n${"x".repeat(1_100_000)}\n`);
+    git(dir, ["commit", "--allow-empty", "--quiet", "-F", message]);
+    git(dir, ["branch", "integration", "main"]);
+    git(dir, ["checkout", "integration", "--quiet"]);
+    markDone(dir, 1, "integration");
+
+    assert.deepEqual(doneIssues(dir, "integration"), [1]);
   } finally {
     cleanup();
   }
@@ -142,6 +162,21 @@ test("saving a dirty worktree produces exactly one WIP commit", () => {
   }
 });
 
+/** Pins that a clean worktree's tree is HEAD's, the same across commits that change no file, and a dirty one has none. */
+test("a clean worktree has HEAD's tree; a dirty one has none", () => {
+  const { dir, cleanup } = makeRepo();
+  try {
+    const tree = cleanTree(dir);
+    assert.equal(tree, git(dir, ["rev-parse", "HEAD^{tree}"]));
+    git(dir, ["commit", "--allow-empty", "-m", "marker", "--quiet"]);
+    assert.equal(cleanTree(dir), tree);
+    writeFileSync(join(dir, "scratch.txt"), "mid-edit\n");
+    assert.equal(cleanTree(dir), undefined);
+  } finally {
+    cleanup();
+  }
+});
+
 test("saving a clean worktree produces no commit", () => {
   const { dir, cleanup } = makeRepo();
   try {
@@ -173,7 +208,7 @@ test("clean branches merge with their Done markers and leave nothing ready", () 
     const two = finishedIssueBranch(dir, 2, "two.txt", "two\n");
     git(dir, ["checkout", "integration", "--quiet"]);
 
-    assert.deepEqual(mergeEach(dir, [one, two]), { merged: [one, two], conflicted: [] });
+    assert.deepEqual(mergeEach(dir, [one, two]), { merged: [one, two], conflicted: [], conflictFiles: {} });
     assert.deepEqual(doneIssues(dir, "integration").sort(), [1, 2]);
     assert.deepEqual(
       readyToMerge(dir, "integration", [
@@ -199,6 +234,7 @@ test("a conflicting branch is aborted and reported, and the next branch still me
     assert.deepEqual(mergeEach(dir, [one, two, three]), {
       merged: [one, three],
       conflicted: [two],
+      conflictFiles: { [two]: ["README.md"] },
     });
     assert.equal(git(dir, ["status", "--porcelain"]), "");
     assert.deepEqual(doneIssues(dir, "integration").sort(), [1, 3]);
@@ -221,7 +257,11 @@ test("a merge an interrupted agent left half-resolved is abandoned before mergin
       // The conflict is the point: it leaves MERGE_HEAD behind.
     }
 
-    assert.deepEqual(mergeEach(dir, [two]), { merged: [], conflicted: [two] });
+    assert.deepEqual(mergeEach(dir, [two]), {
+      merged: [],
+      conflicted: [two],
+      conflictFiles: { [two]: ["README.md"] },
+    });
     assert.equal(git(dir, ["status", "--porcelain"]), "");
   } finally {
     cleanup();
@@ -428,6 +468,113 @@ test("a batch branch that has merged main in is no longer behind", () => {
     git(dir, ["merge", "--no-ff", "--no-edit", "--quiet", "main"]);
 
     assert.equal(isBehind(dir, "batch", "main"), false);
+  } finally {
+    cleanup();
+  }
+});
+
+// --- git answering vs. git failing --------------------------------------------
+
+test("a git command that exits non-zero has answered", () => {
+  assert.equal(gitAnswered(Object.assign(new Error("exit 1"), { status: 1 })), true);
+});
+
+/** Pins #855's root cause: an overflowed buffer once read as "no Done markers". */
+test("a git command killed for overflowing its buffer has not answered", () => {
+  const overflow = Object.assign(new Error("spawnSync git ENOBUFS"), { code: "ENOBUFS", status: null });
+  assert.equal(gitAnswered(overflow), false);
+});
+
+test("a missing git binary has not answered", () => {
+  assert.equal(gitAnswered(Object.assign(new Error("spawnSync git ENOENT"), { code: "ENOENT" })), false);
+});
+
+// --- pruning -----------------------------------------------------------------
+
+/** A batch branch `integration` with issue #1 finished and merged into it, main checked out. */
+function batchWithOneMergedIssue(dir: string): string {
+  git(dir, ["branch", "integration", "main"]);
+  const one = finishedIssueBranch(dir, 1, "one.txt", "one\n");
+  git(dir, ["checkout", "integration", "--quiet"]);
+  mergeEach(dir, [one]);
+  git(dir, ["checkout", "main", "--quiet"]);
+  return one;
+}
+
+test("a shipped batch branch and the issue branches merged into it are prunable", () => {
+  const { dir, cleanup } = makeRepo();
+  try {
+    const one = batchWithOneMergedIssue(dir);
+
+    assert.deepEqual(
+      prunableBranches(dir, {
+        batchBranches: ["integration"],
+        issueBranches: [one],
+        mainRef: "main",
+        mergedPrHeadBranches: ["integration"],
+      }),
+      { batches: ["integration"], issues: [one] },
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("an unshipped batch branch and its issue branches are kept", () => {
+  const { dir, cleanup } = makeRepo();
+  try {
+    const one = batchWithOneMergedIssue(dir);
+
+    assert.deepEqual(
+      prunableBranches(dir, {
+        batchBranches: ["integration"],
+        issueBranches: [one],
+        mainRef: "main",
+        mergedPrHeadBranches: [],
+      }),
+      { batches: [], issues: [] },
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("an issue branch with commits no shipped batch holds is kept", () => {
+  const { dir, cleanup } = makeRepo();
+  try {
+    const one = batchWithOneMergedIssue(dir);
+    git(dir, ["checkout", one, "--quiet"]);
+    commitFile(dir, "later.txt", "later\n", "work after the merge");
+    git(dir, ["checkout", "main", "--quiet"]);
+
+    assert.deepEqual(
+      prunableBranches(dir, {
+        batchBranches: ["integration"],
+        issueBranches: [one],
+        mainRef: "main",
+        mergedPrHeadBranches: ["integration"],
+      }),
+      { batches: ["integration"], issues: [] },
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("an issue branch already on main is prunable without a batch", () => {
+  const { dir, cleanup } = makeRepo();
+  try {
+    git(dir, ["branch", "sandcastle/issue-1", "main"]);
+
+    assert.deepEqual(
+      prunableBranches(dir, {
+        batchBranches: [],
+        issueBranches: ["sandcastle/issue-1"],
+        mainRef: "main",
+        mergedPrHeadBranches: [],
+      }),
+      { batches: [], issues: ["sandcastle/issue-1"] },
+    );
   } finally {
     cleanup();
   }

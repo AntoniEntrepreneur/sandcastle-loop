@@ -8,6 +8,7 @@ import {
   runFatalStop,
   runIssueLoop,
   RunFatalError,
+  throwIfRunFatal,
   type IssueLoopPorts,
   type RunResult,
 } from "./issueLoop.mts";
@@ -27,8 +28,15 @@ const red = (stdout: string, exitCode = 1): ExecResult => ({ exitCode, stdout, s
 function fakePorts(
   script: RunResult[],
   checks: ExecResult[] = [],
-  extra: { saved?: string; failResume?: boolean | Error } = {},
+  extra: {
+    saved?: string;
+    failResume?: boolean | Error;
+    trees?: (string | undefined)[];
+    emptyDiff?: boolean;
+  } = {},
 ) {
+  const treeQueue = [...(extra.trees ?? [])];
+  const greenTrees = new Set<string>();
   const prompts: string[] = [];
   const execs: string[] = [];
   const checkQueue = [...checks];
@@ -36,6 +44,7 @@ function fakePorts(
   const calls: string[] = [];
   const saves: string[] = [];
   const coldPrompts: (string | undefined)[] = [];
+  const reviewerPrompts: (string | undefined)[] = [];
   const queue = [...script];
   const next = () => queue.shift() ?? run();
   const ports: IssueLoopPorts = {
@@ -50,6 +59,7 @@ function fakePorts(
         return next();
       }
       if (role === "implementer") coldPrompts.push(extraPrompt);
+      else reviewerPrompts.push(extraPrompt);
       calls.push(role === "reviewer" ? `start:reviewer:${model}` : `start:${role}`);
       return next();
     },
@@ -77,9 +87,15 @@ function fakePorts(
       sessions.push("clear");
     },
     abortSignal: new AbortController().signal,
+    cleanTree: () => treeQueue.shift(),
+    isGreenTree: (tree) => greenTrees.has(tree),
+    recordGreenTree(tree) {
+      greenTrees.add(tree);
+    },
     reviewerModel: () => ({ model: "reviewer-model", reason: "3 changed lines, under 200" }),
+    hasChanges: () => !extra.emptyDiff,
   };
-  return { ports, calls, saves, prompts, execs, sessions, coldPrompts };
+  return { ports, calls, saves, prompts, execs, sessions, coldPrompts, reviewerPrompts, greenTrees };
 }
 
 const options = { maxSteps: 5, continuePrompt: "continue", checkCommand: "CHECK" };
@@ -268,6 +284,22 @@ test("a red check resumes the implementer with the output tail; green then write
   assert.ok(!prompts[0].includes("x".repeat(6000) + "END"));
 });
 
+/** Pins that each check's result is logged with the step it followed, so a log shows whether step 1 failed (#810). */
+test("each check's result is logged with the step or reviewer it followed", async () => {
+  const { ports } = fakePorts(
+    [run({ completed: true }), run({ completed: true }), run()],
+    [red("glossary term micro-skill"), green, red("lint broke"), green],
+  );
+  const logs: string[] = [];
+  await runIssueLoop(ports, { ...options, log: (m) => logs.push(m) });
+  const checks = logs.filter((m) => m.startsWith("Check after"));
+  assert.equal(checks.length, 4);
+  assert.match(checks[0]!, /^Check after step 1 failed:\n[\s\S]*glossary term micro-skill/);
+  assert.equal(checks[1], "Check after step 2 passed.");
+  assert.match(checks[2]!, /^Check after the reviewer failed:\n[\s\S]*lint broke/);
+  assert.equal(checks[3], "Check after the reviewer's fix round 1 passed.");
+});
+
 /** Pins that three red rounds leave the issue unfinished with no Done marker. */
 test("three red rounds leave the issue unfinished with no Done marker", async () => {
   const { ports, calls } = fakePorts(
@@ -302,6 +334,66 @@ test("a red check after the reviewer resumes the reviewer", async () => {
   assert.match(prompts[0], /lint broke/);
 });
 
+/** Pins that a reviewer restarted cold after a red check is handed the failure, not just the review prompt. */
+test("a reviewer restarted after a red check is given the failure", async () => {
+  const { ports, calls, reviewerPrompts } = fakePorts(
+    [run({ completed: true }), run({ resumable: false }), run()],
+    [green, red("lint broke"), green],
+  );
+  const result = await runIssueLoop(ports, options);
+  assert.equal(result.completed, true);
+  assert.deepEqual(calls, [
+    "start:implementer",
+    "start:reviewer:reviewer-model",
+    "start:reviewer:reviewer-model",
+    "done",
+  ]);
+  assert.equal(reviewerPrompts[0], undefined);
+  assert.match(reviewerPrompts[1]!, /lint broke/);
+});
+
+/** Pins that a reviewer who changed nothing is not checked again: the tree already passed. */
+test("a reviewer who changed nothing is not checked again", async () => {
+  const { ports, calls, execs } = fakePorts([run({ completed: true }), run()], [], {
+    trees: ["t1", "t1"],
+  });
+  const result = await runIssueLoop(ports, options);
+  assert.equal(result.completed, true);
+  assert.deepEqual(execs, ["CHECK"]);
+  assert.deepEqual(calls, ["start:implementer", "start:reviewer:reviewer-model", "done"]);
+});
+
+/** Pins that a reviewer who changed the tree is checked again. */
+test("a reviewer who changed the tree is checked again", async () => {
+  const { ports, execs } = fakePorts([run({ completed: true }), run()], [], {
+    trees: ["t1", "t2"],
+  });
+  await runIssueLoop(ports, options);
+  assert.deepEqual(execs, ["CHECK", "CHECK"]);
+});
+
+/** Pins that a red check never marks its tree green, so the same tree is checked again. */
+test("a red check never marks its tree green", async () => {
+  const { ports, execs, greenTrees } = fakePorts(
+    [run({ completed: true }), run({ completed: true }), run()],
+    [red("broke"), green, green],
+    { trees: ["t1", "t1", "t2"] },
+  );
+  await runIssueLoop(ports, options);
+  assert.deepEqual(execs, ["CHECK", "CHECK", "CHECK"]);
+  assert.deepEqual([...greenTrees], ["t1", "t2"]);
+});
+
+/** Pins that a dirty worktree, which has no tree id, is always checked and never remembered. */
+test("a dirty worktree is always checked and never remembered", async () => {
+  const { ports, execs, greenTrees } = fakePorts([run({ completed: true }), run()], [], {
+    trees: [undefined, undefined],
+  });
+  await runIssueLoop(ports, options);
+  assert.deepEqual(execs, ["CHECK", "CHECK"]);
+  assert.equal(greenTrees.size, 0);
+});
+
 /** Pins that a reviewer that never turns the check green leaves the issue unfinished. */
 test("a reviewer that never turns the check green leaves the issue unfinished", async () => {
   const { ports, calls } = fakePorts(
@@ -320,6 +412,16 @@ test("the reviewer model comes from the port and its reason is logged", async ()
   await runIssueLoop(ports, { ...options, log: (m) => logs.push(m) });
   assert.ok(calls.includes("start:reviewer:reviewer-model"));
   assert.ok(logs.some((m) => /reviewer-model.*3 changed lines/.test(m)));
+});
+
+/** Pins the 55 reviews of "(0 changed lines)" in the runs of 2026-10-28. */
+test("a branch with nothing to review skips the reviewer and is marked done", async () => {
+  const { ports, calls } = fakePorts([run({ completed: true })], [], { emptyDiff: true });
+  const logs: string[] = [];
+  const result = await runIssueLoop(ports, { ...options, log: (m) => logs.push(m) });
+  assert.deepEqual(calls, ["start:implementer", "done"]);
+  assert.equal(result.completed, true);
+  assert.ok(logs.some((m) => /no reviewer/i.test(m)));
 });
 
 /** Pins the review finding on #497: the pending fix was dropped on a cold start. */
@@ -407,7 +509,55 @@ test("an SDK error naming an unreachable API is a run-fatal network stop", () =>
 });
 
 test("a RunFatalError is returned as-is, keeping what it read from the full output", () => {
-  const original = new RunFatalError("quota", "x", new Date(0));
+  const original = new RunFatalError("quota", "x", { resetAt: new Date(0) });
 
   assert.equal(runFatalStop(original), original);
+});
+
+/** Pins that an AGY_ERROR naming a spent quota or credits balance halts the run with the Gemini message. */
+test("an AGY_ERROR quota or credits line is a Gemini quota stop", () => {
+  for (const text of [
+    "AGY_ERROR: Your AI credits balance is too low to continue.",
+    "AGY_ERROR: insufficient credits for this request",
+    "AGY_ERROR: you are out of credits",
+    "Implementing #244…\nAGY_ERROR: Your AI credits balance is too low to continue.\n",
+  ]) {
+    assert.throws(
+      () => throwIfRunFatal(text),
+      (error: unknown) =>
+        error instanceof RunFatalError &&
+        error.kind === "quota" &&
+        error.provider === "gemini" &&
+        error.message.includes("Gemini quota spent — re-run when it resets"),
+    );
+  }
+});
+
+/** Pins that any other AGY_ERROR is the group's own dead run, not run-fatal. */
+test("a non-quota AGY_ERROR is not a run-fatal stop", () => {
+  assert.doesNotThrow(() => throwIfRunFatal("AGY_ERROR: the model returned an invalid response"));
+});
+
+/** Pins that output quoting an AGY_ERROR, rather than carrying one, never stops the run (#729). */
+test("an AGY_ERROR quoted mid-line by an agent is not a quota stop", () => {
+  assert.doesNotThrow(() =>
+    throwIfRunFatal('+ const LINE = "AGY_ERROR: Your AI credits balance is too low to continue.";'),
+  );
+});
+
+/** Pins that a file `agy` merely read, echoed in its tool output, is not a quota stop (#728). */
+test("quota phrases in agy's tool output are not a quota stop", () => {
+  const stream = [
+    '{"event":"init","conversation_id":"c-1","init":{"model":"gemini-3.8-flash-high"}}',
+    '{"event":"step_update","step_update":{"step_type":"tool","tool_info":{"output":"/usage limit reached/i,\\n/session limit/i,"}}}',
+    '{"event":"result","result":{"status":"SUCCESS","response":"Done.\\n<promise>COMPLETE</promise>"}}',
+  ].join("\n");
+  assert.doesNotThrow(() => throwIfRunFatal(stream));
+});
+
+/** Pins that a quota phrase in agy's own final response or error still stops the run. */
+test("a quota phrase in agy's final result still stops the run", () => {
+  const stream =
+    '{"event":"result","result":{"status":"ERROR","response":"","error":"You\'ve hit your session limit"}}';
+  assert.throws(() => throwIfRunFatal(stream), RunFatalError);
 });

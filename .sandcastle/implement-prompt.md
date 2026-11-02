@@ -16,10 +16,10 @@ Work on branch {{BRANCH}}. Make commits and run tests.
 # RESUMPTION
 
 **This branch may already carry your own unfinished work.** A previous run can
-be cut off at any moment — most often because the developer's Claude usage ran
-out mid-task — and it leaves everything it had done on this branch. Before you
-plan anything, read what is already there. The orchestrator has run these for
-you; do not run them again.
+be cut off at any moment — most often because your usage ran out mid-task —
+and it leaves everything it had done on this branch. Before you plan anything,
+read what is already there. The orchestrator has run these for you; do not run
+them again.
 
 Commits already made for this issue (newest first, full messages). Read the
 `Blockers or notes for next iteration` line of the most recent one; your past
@@ -69,12 +69,9 @@ Pay extra attention to test files that touch the relevant parts of the code.
 
 # EXECUTION
 
-If applicable, use RGR to complete the task.
-
-1. RED: write one test
-2. GREEN: write the implementation to pass that test
-3. REPEAT until done
-4. REFACTOR the code
+If applicable, use the `tdd` skill. The seams named in the issue or its parent
+spec are the confirmed seams; with none named, pick the highest existing seam
+and note it in the commit's key decisions.
 
 # FEEDBACK LOOPS
 
@@ -95,10 +92,10 @@ to decide whether you are making progress.
 Every flag, subcommand, API path, config key or file convention you write for a
 service outside this repo (GitHub, hosting, auth, frameworks…) is checked
 against its source before you commit: `<cli> <command> --help` for a CLI the
-sandbox has (`gh`, and any PROJECT NOTES names), otherwise the vendor's docs via
-WebFetch. Name the URL or command in the commit's key decisions. One no source
-confirms goes in the commit's `Blockers or notes for next iteration` as
-unverified, so the PR carries it to the human who runs it.
+sandbox has (`gh`, and any PROJECT NOTES names), otherwise the vendor's docs,
+fetched from the web. Name the URL or command in the commit's key decisions.
+One no source confirms goes in the commit's `Blockers or notes for next
+iteration` as unverified, so the PR carries it to the human who runs it.
 
 # PROJECT NOTES
 
