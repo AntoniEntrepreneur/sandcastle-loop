@@ -13,8 +13,17 @@
 // merged, picked up or closed.
 
 import { execFileSync } from "node:child_process";
+import { existsSync, realpathSync } from "node:fs";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 
-import { parseDoneTrailers, type DoneMarker } from "./groups.mts";
+import {
+  parseDoneTrailers,
+  parseImplementerTrailers,
+  parsePrBodyTrailers,
+  parseReviewerTrailers,
+  type DoneMarker,
+  type WrittenPr,
+} from "./groups.mts";
 
 // Node's default is 1 MiB, which a batch branch's log outgrows (#855).
 const MAX_BUFFER = 256 * 1024 * 1024;
@@ -55,6 +64,11 @@ function gitQuiet(cwd: string, args: string[]): string | undefined {
 /** Whether `branch` exists locally in `cwd`. */
 function branchExists(cwd: string, branch: string): boolean {
   return gitQuiet(cwd, ["rev-parse", "--verify", "--quiet", branch]) !== undefined;
+}
+
+/** The commit `ref` names right now, or undefined when it names none. */
+export function resolveCommit(cwd: string, ref: string): string | undefined {
+  return gitQuiet(cwd, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
 }
 
 /** Whether `ancestor` is reachable from `ref` — i.e. already merged into it. */
@@ -137,6 +151,109 @@ export function markDone(
     `Sandcastle-Batch: ${integrationBranch}`,
   ].join("\n");
   git(worktreeCwd, ["commit", "--allow-empty", "--no-verify", "-m", message]);
+}
+
+/**
+ * Record that the implementer ended with COMPLETE on the branch checked out at
+ * `worktreeCwd`: an empty commit carrying `Sandcastle-Implementer: #<issue>`.
+ * Markers are found by trailer, never by content.
+ */
+export function markImplementerComplete(
+  worktreeCwd: string,
+  issueNumber: number,
+): void {
+  const message = [
+    `Sandcastle: #${issueNumber} implementer complete`,
+    "",
+    `Sandcastle-Implementer: #${issueNumber}`,
+  ].join("\n");
+  git(worktreeCwd, ["commit", "--allow-empty", "--no-verify", "-m", message]);
+}
+
+/**
+ * Whether the branch checked out at `worktreeCwd` has the implementer's
+ * COMPLETE recorded for its current commit. Any later commit invalidates it.
+ */
+export function hasImplementerComplete(
+  worktreeCwd: string,
+  issueNumber: number,
+): boolean {
+  const message = gitQuiet(worktreeCwd, ["log", "-1", "--format=%B"]);
+  if (!message) return false;
+  return (
+    parseImplementerTrailers(message)?.issue === issueNumber ||
+    parseReviewerTrailers(message)?.issue === issueNumber
+  );
+}
+
+/**
+ * Record that the reviewer finished on the branch checked out at
+ * `worktreeCwd`: an empty commit carrying `Sandcastle-Reviewer: #<issue>`.
+ * Markers are found by trailer, never by content.
+ */
+export function markReviewerComplete(
+  worktreeCwd: string,
+  issueNumber: number,
+): void {
+  const message = [
+    `Sandcastle: #${issueNumber} reviewer complete`,
+    "",
+    `Sandcastle-Reviewer: #${issueNumber}`,
+  ].join("\n");
+  git(worktreeCwd, ["commit", "--allow-empty", "--no-verify", "-m", message]);
+}
+
+/**
+ * Whether the branch checked out at `worktreeCwd` has the reviewer's
+ * review recorded for its current commit. Any later commit invalidates it.
+ */
+export function hasReviewerComplete(
+  worktreeCwd: string,
+  issueNumber: number,
+): boolean {
+  const message = gitQuiet(worktreeCwd, ["log", "-1", "--format=%B"]);
+  if (!message) return false;
+  return parseReviewerTrailers(message)?.issue === issueNumber;
+}
+
+/**
+ * Record that the PR was written for the integration branch checked out at
+ * `worktreeCwd`: an empty commit carrying a `Sandcastle-Pr-Body` trailer naming
+ * the branch, with the body above it and the title in a `Sandcastle-Pr-Title`
+ * trailer, so a later run can reuse the writeup rather than pay an agent for
+ * it again. Markers are found by trailer, never by content.
+ */
+export function markPrWritten(
+  worktreeCwd: string,
+  integrationBranch: string,
+  pr: WrittenPr,
+): void {
+  const message = [
+    "Sandcastle: PR body complete",
+    "",
+    pr.body,
+    "",
+    `Sandcastle-Pr-Body: ${integrationBranch}`,
+    ...(pr.title ? [`Sandcastle-Pr-Title: ${pr.title}`] : []),
+  ].join("\n");
+  git(worktreeCwd, ["commit", "--allow-empty", "--no-verify", "-m", message]);
+}
+
+/**
+ * The PR recorded for `integrationBranch`'s current commit, or undefined when
+ * its last commit carries no PR-body marker for this branch, or an empty body.
+ * Any later commit leaves the marker behind HEAD, which is what makes the PR
+ * writer run again.
+ */
+export function recordedPr(
+  cwd: string,
+  integrationBranch: string,
+): WrittenPr | undefined {
+  const message = gitQuiet(cwd, ["log", "-1", "--format=%B", integrationBranch]);
+  if (!message) return undefined;
+  const marker = parsePrBodyTrailers(message);
+  if (marker?.batch !== integrationBranch || !marker.body) return undefined;
+  return marker.title ? { title: marker.title, body: marker.body } : { body: marker.body };
 }
 
 /** Every Done marker reachable from `ref`, parsed from its trailers. */
@@ -362,11 +479,23 @@ export type CatchUp = "no-remote" | "up-to-date" | "fast-forwarded" | "diverged"
 /** The worktree that has `branch` checked out, if any. */
 function worktreeHolding(cwd: string, branch: string): string | undefined {
   let path: string | undefined;
-  for (const line of git(cwd, ["worktree", "list", "--porcelain"]).split("\n")) {
+  for (const line of git(cwd, ["worktree", "list", "--porcelain", "-z"]).split("\0")) {
     if (line.startsWith("worktree ")) path = line.slice("worktree ".length);
     if (line === `branch refs/heads/${branch}`) return path;
   }
   return undefined;
+}
+
+/** Find the checkout holding a branch outside the worktree folder Sandcastle owns. */
+export function foreignWorktreeHolding(cwd: string, branch: string, ownedFolder: string): string | undefined {
+  const worktree = worktreeHolding(cwd, branch);
+  if (!worktree) return undefined;
+  const root = resolve(cwd, ownedFolder);
+  const canonicalRoot = existsSync(root) ? realpathSync(root) : root;
+  const fromRoot = relative(canonicalRoot, worktree);
+  return fromRoot === "" || fromRoot === ".." || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)
+    ? worktree
+    : undefined;
 }
 
 /**
@@ -375,15 +504,17 @@ function worktreeHolding(cwd: string, branch: string): string | undefined {
  * branch is published from its stale tip and the push is rejected (#426).
  *
  * A branch already containing `remoteRef` is left alone, local commits and
- * all. A branch checked out in a worktree is fast-forwarded there, so the
- * worktree's files move with it. "diverged" changes nothing: both sides have
+ * all. Only a checkout inside `ownedFolder` may be fast-forwarded there.
+ * A foreign checkout throws before any ref or files change. "diverged" changes nothing: both sides have
  * commits the other lacks, and choosing between them is a human's call.
  */
-export function catchUpWithRemote(cwd: string, branch: string, remoteRef: string): CatchUp {
+export function catchUpWithRemote(cwd: string, branch: string, remoteRef: string, ownedFolder: string): CatchUp {
   if (!branchExists(cwd, remoteRef)) return "no-remote";
   if (isAncestorOf(cwd, remoteRef, branch)) return "up-to-date";
   if (!isAncestorOf(cwd, branch, remoteRef)) return "diverged";
 
+  const held = foreignWorktreeHolding(cwd, branch, ownedFolder);
+  if (held) throw new Error(`Cannot catch up ${branch}: checked out in foreign worktree ${held}.`);
   const worktree = worktreeHolding(cwd, branch);
   if (worktree) {
     git(worktree, ["merge", "--ff-only", "--quiet", remoteRef]);

@@ -2,6 +2,8 @@
 // tool calls fetching them. Pure functions over strings; main.mts owns the
 // `gh` and file reads that feed them.
 
+import { agentSaidText } from "./groups.mts";
+
 /** One issue as handed to an implementer. */
 export interface IssueText {
   number: number;
@@ -50,11 +52,25 @@ export function renderIssueContext(input: {
 /**
  * The PR body the PR writer put between `<pr-body>` tags, if it wrote one.
  * The last pair wins: the agent may quote the tags while reasoning first.
+ * The body is extracted from the agent's said text (agentSaidText), so an agy
+ * body is not JSON-escaped or split across stream chunks (#805).
  */
 export function extractPrBody(stdout: string): string | undefined {
-  const matches = [...stdout.matchAll(/<pr-body>([\s\S]*?)<\/pr-body>/g)];
+  const said = agentSaidText(stdout);
+  const matches = [...said.matchAll(/<pr-body>([\s\S]*?)<\/pr-body>/g)];
   const body = matches.at(-1)?.[1]?.trim();
   return body ? body : undefined;
+}
+
+/**
+ * The PR title the PR writer put between `<pr-title>` tags, if it wrote one,
+ * collapsed onto one line. The last pair wins, as for the body.
+ */
+export function extractPrTitle(stdout: string): string | undefined {
+  const said = agentSaidText(stdout);
+  const matches = [...said.matchAll(/<pr-title>([\s\S]*?)<\/pr-title>/g)];
+  const title = matches.at(-1)?.[1]?.replace(/\s+/g, " ").trim();
+  return title ? title : undefined;
 }
 
 /**

@@ -22,3 +22,8 @@ app with `uv run uvicorn backend.main:app --port 8000 >/tmp/api.log 2>&1 &` and
 
 The glossary hook refuses edits that use these terms. Use the canonical term
 from GLOSSARY.md instead: {{AVOID_TERMS}}
+
+Not every agent has that hook, and a banned word inside a name you declare
+(`level_entry`, `continuePlay`) counts. Before signalling completion, run
+`uv run python scripts/check_glossary.py` (a few seconds) and rename whatever
+it reports.

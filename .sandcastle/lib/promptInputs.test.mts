@@ -1,11 +1,14 @@
 // Unit tests for the implementer prompt inputs gathered on the host.
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
   extractAvoidTerms,
   extractPrBody,
+  extractPrTitle,
   fillProjectPlaceholders,
   parentIssueNumber,
   renderIssueContext,
@@ -69,16 +72,65 @@ test("renderIssueContext omits the parent section when there is none", () => {
   assert.ok(!text.includes("Parent spec"));
 });
 
-test("the PR body is the last tagged block the writer output", () => {
+/** Pins that the PR body is extracted from the last tagged block in Claude plain-text stdout. */
+test("Claude plain-text stdout yields today's body", () => {
   const stdout = "I will wrap it in <pr-body></pr-body>.\n<pr-body>\n## Summary\n\nx\n</pr-body>\n<promise>COMPLETE</promise>";
 
   assert.equal(extractPrBody(stdout), "## Summary\n\nx");
 });
 
-test("a writer that output no body yields none", () => {
+/** Pins that an agy NDJSON stream unescapes multi-line bodies rather than leaving raw JSON escapes (#805). */
+test("an agy NDJSON stream whose final result.response carries a multi-line <pr-body> yields the unescaped body", () => {
+  const stream = [
+    '{"event":"init","conversation_id":"c-1","init":{"model":"gemini-3.8-flash-medium"}}',
+    '{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"thinking..."}}',
+    '{"event":"result","result":{"status":"SUCCESS","response":"Here is the body:\\n\\n<pr-body>\\n## Summary\\n\\nFirst line\\nSecond line\\n</pr-body>\\n\\n<promise>COMPLETE</promise>"}}',
+  ].join("\n");
+
+  assert.equal(extractPrBody(stream), "## Summary\n\nFirst line\nSecond line");
+});
+
+/** Pins that a stream or plain output with no body yields undefined (#805). */
+test("a stream with no body yields undefined", () => {
+  const stream = [
+    '{"event":"init","conversation_id":"c-1","init":{"model":"gemini-3.8-flash-medium"}}',
+    '{"event":"result","result":{"status":"SUCCESS","response":"No body tags here.\\n<promise>COMPLETE</promise>"}}',
+  ].join("\n");
+
+  assert.equal(extractPrBody(stream), undefined);
   assert.equal(extractPrBody("<promise>COMPLETE</promise>"), undefined);
   assert.equal(extractPrBody("<pr-body>  </pr-body>"), undefined);
 });
+
+/** Pins that the PR title comes from the last tagged block, on one line, and an empty one is none. */
+test("the PR title is the last <pr-title> block, collapsed onto one line", () => {
+  const stdout = "I will use <pr-title></pr-title>.\n<pr-title>\nReturn the cached result\nwhen a save is unchanged\n</pr-title>\n<pr-body>x</pr-body>";
+
+  assert.equal(extractPrTitle(stdout), "Return the cached result when a save is unchanged");
+  assert.equal(extractPrTitle("<pr-body>x</pr-body>"), undefined);
+  assert.equal(extractPrTitle("<pr-title>  </pr-title>"), undefined);
+});
+
+/** Pins that the PR prompt explicitly names the path to the pr skill file (#805). */
+test("the PR prompt names the pr skill file's path", () => {
+  const prompt = readFileSync(join(import.meta.dirname, "../pr-prompt.md"), "utf-8");
+  assert.match(prompt, /\.agents\/skills\/pr\/SKILL\.md/);
+});
+
+/** Pins that the PR prompt asks for the title the orchestrator reads. */
+test("the PR prompt asks for a <pr-title>", () => {
+  const prompt = readFileSync(join(import.meta.dirname, "../pr-prompt.md"), "utf-8");
+  assert.match(prompt, /<pr-title>/);
+});
+
+/** Pins the rule `agy` relies on: Claude Code's sandbox settings for foreground commands don't reach it. */
+for (const name of ["implement-prompt.md", "review-prompt.md"]) {
+  test(`${name} keeps tests in the foreground under a time limit`, () => {
+    const prompt = readFileSync(join(import.meta.dirname, "..", name), "utf-8");
+    assert.match(prompt, /foreground/);
+    assert.match(prompt, /`timeout 480/);
+  });
+}
 
 /** Pins that project notes can carry a run-time placeholder through to the SDK. */
 test("project placeholders are filled and run-time ones left for the SDK", () => {

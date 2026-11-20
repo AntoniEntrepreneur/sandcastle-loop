@@ -5,6 +5,7 @@
 /** Files the project owns: an update never overwrites them, so they travel only as examples. */
 export const PROJECT_OWNED_FILES = [
   ".sandcastle/sandcastle.config.mts",
+  ".sandcastle/sandcastle.config.test.mts",
   ".sandcastle/project-notes.md",
   ".sandcastle/Dockerfile",
   ".sandcastle/CODING_STANDARDS.md",

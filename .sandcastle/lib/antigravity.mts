@@ -27,15 +27,18 @@
 // from the stdin the engine feeds (one argument, so well under the 128 KB
 // Linux limit). The rest are `--output-format stream-json`, `--model <slug>`
 // and `--dangerously-skip-permissions`. That last is passed unconditionally
-// rather than trusting print mode's reported `always-proceed` default, and
-// there is no `--effort`: the `-high` model variant carries it. A resumed run
-// adds `--conversation <id>`, which `agy`'s changelog (1.1.x, "headless print
-// mode resumption (`--conversation`/`-c` `-p ...`)") lists as resuming in
-// print mode; the long form, since `-c` is easily read as `--continue`.
+// rather than trusting print mode's reported `always-proceed` default. No
+// `--effort`, though `agy --help` now lists `--effort low|medium|high|xhigh|max`
+// (#802): the `-medium` model variant stays how effort is chosen. A
+// resumed run adds `--conversation <id>`, which `agy`'s changelog (1.1.x,
+// "headless print mode resumption (`--conversation`/`-c` `-p ...`)") lists as
+// resuming in print mode; the long form, since `-c` is easily read as
+// `--continue`.
 
-import { existsSync as defaultExistsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, existsSync as defaultExistsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import type { AgentProvider, IterationUsage } from "@ai-hero/sandcastle";
 
@@ -171,30 +174,133 @@ export function agySignInFiles(
   };
 }
 
-/** Which of the two sign-in files are missing on the host, if any. */
+/**
+ * Which sign-in files are missing, if any: the Google credentials on the host,
+ * and `agy`'s token by its host path when no copy could be staged.
+ */
 export function missingAgySignInFiles(
+  tokenStaged: boolean,
   home: string = homedir(),
   exists: (path: string) => boolean = defaultExistsSync,
 ): string[] {
-  return Object.values(agySignInFiles(home)).filter((path) => !exists(path));
+  const files = agySignInFiles(home);
+  return [
+    ...(exists(files.googleOAuthCreds) ? [] : [files.googleOAuthCreds]),
+    ...(tokenStaged ? [] : [files.antigravityOAuthToken]),
+  ];
+}
+
+// The sandbox mounts a copy of `agy`'s token that Sandcastle owns, never the
+// file at `agy`'s own host path, for two reasons found 2026-11-10 (agy 1.5.5):
+// - On macOS, a host `agy` that can reach the Keychain keeps the token in a
+//   Keychain item (service `gemini`, account `antigravity`) through
+//   zalando/go-keyring, which wraps it as `go-keyring-base64:<base64>`, and
+//   never writes the file. The file is that value unwrapped (JSON with a
+//   `token` field); the wrapped value fails in the sandbox with
+//   "authentication required".
+// - A token file written at that path was gone seconds later, after the run's
+//   own host `agy -p "/usage"` signed in through the Keychain, and the mount
+//   then failed with "Mount hostPath does not exist". The host `agy` appears
+//   to move a file token into the Keychain.
+// Re-staging at every sandbox open copies the token the host keeps refreshed.
+const AGY_KEYCHAIN_SERVICE = "gemini";
+const AGY_KEYCHAIN_ACCOUNT = "antigravity";
+const GO_KEYRING_BASE64 = "go-keyring-base64:";
+const GO_KEYRING_HEX = "go-keyring-encoded:";
+
+/** Unwrap a go-keyring Keychain value into the bytes `agy` keeps in its token file. */
+export function decodeGoKeyringValue(value: string): Buffer {
+  if (value.startsWith(GO_KEYRING_BASE64)) return Buffer.from(value.slice(GO_KEYRING_BASE64.length), "base64");
+  if (value.startsWith(GO_KEYRING_HEX)) return Buffer.from(value.slice(GO_KEYRING_HEX.length), "hex");
+  return Buffer.from(value, "utf-8");
 }
 
 /**
- * The two sign-in files as sandbox bind-mounts, at the paths `agy` reads
- * inside the container. Writable (the default): see the writability
- * evidence above. Not `readonly`, so a later caller must not add it without
- * repeating that check.
+ * Read `agy`'s Keychain item, undefined when there is none or macOS does not
+ * answer. The timeout matters: a Keychain access prompt nobody answers would
+ * otherwise hang the launch.
+ */
+function readAgyKeychainValue(): string | undefined {
+  try {
+    const value = execFileSync(
+      "security",
+      ["find-generic-password", "-s", AGY_KEYCHAIN_SERVICE, "-a", AGY_KEYCHAIN_ACCOUNT, "-w"],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 60_000 },
+    ).trim();
+    return value === "" ? undefined : value;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Read a file's bytes, undefined when it does not exist or cannot be read. */
+function readFileIfPresent(path: string): Buffer | undefined {
+  try {
+    return readFileSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Write `contents` to `path` readable by the owner only, creating its folder.
+ * Rewrites in place, never by rename: a running sandbox's bind mount follows
+ * the file's inode. The `chmodSync` covers a file that already existed, whose
+ * mode `writeFileSync`'s `mode` option leaves alone.
+ */
+function writeOwnerOnlyFile(path: string, contents: Buffer): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, contents, { mode: 0o600 });
+  chmodSync(path, 0o600);
+}
+
+/**
+ * Copy `agy`'s current token to `stagedPath`, from the macOS Keychain or else
+ * from `agy`'s token file under `home`. Mutates `stagedPath`, only when the
+ * token changed. Returns whether a staged token is there afterwards.
+ */
+export function stageAgyToken(
+  stagedPath: string,
+  home: string = homedir(),
+  ports: {
+    platform: NodeJS.Platform;
+    readKeychain: () => string | undefined;
+    readFile: (path: string) => Buffer | undefined;
+    writeFile: (path: string, contents: Buffer) => void;
+  } = {
+    platform: process.platform,
+    readKeychain: readAgyKeychainValue,
+    readFile: readFileIfPresent,
+    writeFile: writeOwnerOnlyFile,
+  },
+): boolean {
+  const keychainValue = ports.platform === "darwin" ? ports.readKeychain() : undefined;
+  const token =
+    keychainValue === undefined
+      ? ports.readFile(agySignInFiles(home).antigravityOAuthToken)
+      : decodeGoKeyringValue(keychainValue);
+  const staged = ports.readFile(stagedPath);
+  if (token === undefined) return staged !== undefined;
+  if (staged === undefined || !staged.equals(token)) ports.writeFile(stagedPath, token);
+  return true;
+}
+
+/**
+ * The Google credentials and the staged token as sandbox bind-mounts, at the
+ * paths `agy` reads inside the container. Writable (the default): see the
+ * writability evidence above. Not `readonly`, so a later caller must not add
+ * it without repeating that check.
  */
 export function agySignInMounts(
+  stagedTokenPath: string,
   home: string = homedir(),
 ): { hostPath: string; sandboxPath: string }[] {
-  const files = agySignInFiles(home);
   return [
-    { hostPath: files.googleOAuthCreds, sandboxPath: join(AGY_SANDBOX_HOME, ...GOOGLE_OAUTH_CREDS_RELATIVE) },
     {
-      hostPath: files.antigravityOAuthToken,
-      sandboxPath: join(AGY_SANDBOX_HOME, ...ANTIGRAVITY_OAUTH_TOKEN_RELATIVE),
+      hostPath: agySignInFiles(home).googleOAuthCreds,
+      sandboxPath: join(AGY_SANDBOX_HOME, ...GOOGLE_OAUTH_CREDS_RELATIVE),
     },
+    { hostPath: stagedTokenPath, sandboxPath: join(AGY_SANDBOX_HOME, ...ANTIGRAVITY_OAUTH_TOKEN_RELATIVE) },
   ];
 }
 

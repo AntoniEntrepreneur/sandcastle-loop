@@ -68,3 +68,23 @@ index 2a1d6d7..043bd6a 100644
          throw error;
        }
        const baseResult = {
+diff --git a/node_modules/@ai-hero/sandcastle/dist/chunk-VOG34SRF.js b/node_modules/@ai-hero/sandcastle/dist/chunk-VOG34SRF.js
+index 0000000..0000000 100644
+--- a/node_modules/@ai-hero/sandcastle/dist/chunk-VOG34SRF.js
++++ b/node_modules/@ai-hero/sandcastle/dist/chunk-VOG34SRF.js
+@@ -25227,9 +25227,12 @@
+     )
+   );
+   if (fetchResult._tag === "Left") {
+-    console.log(
+-      `Could not fetch from origin (reusing worktree at ${worktreePath} as-is, branch '${branch}')`
+-    );
++    // A branch never pushed has nothing on origin to refresh from: not worth a line.
++    if (!/couldn't find remote ref/.test(String(fetchResult.left?.message ?? ""))) {
++      console.log(
++        `Could not fetch from origin (reusing worktree at ${worktreePath} as-is, branch '${branch}')`
++      );
++    }
+     return;
+   }
+   const before2 = yield* execGit(["rev-parse", "HEAD"], worktreePath).pipe(

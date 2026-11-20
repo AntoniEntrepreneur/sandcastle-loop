@@ -91,20 +91,66 @@ test("saving a session keeps the recorded reset time", () =>
 /** Pins that an issue's implementer label is recorded and read back across handles. */
 test("an implementer label is recorded and read back across handles", () =>
   withDir((dir) => {
-    openRunState(dir).recordImplementer(244, "gemini-3.8-flash-high (agy)");
+    openRunState(dir).recordImplementer(244, "gemini-3.8-flash-medium (agy)");
     const state = openRunState(dir);
-    assert.deepEqual(state.implementedBy(), { "244": "gemini-3.8-flash-high (agy)" });
+    assert.deepEqual(state.implementedBy(), { "244": "gemini-3.8-flash-medium (agy)" });
   }));
 
 /** Pins that recording a later issue's implementer keeps an earlier one's. */
 test("two issues' implementer labels both survive", () =>
   withDir((dir) => {
-    openRunState(dir).recordImplementer(244, "gemini-3.8-flash-high (agy)");
+    openRunState(dir).recordImplementer(244, "gemini-3.8-flash-medium (agy)");
     openRunState(dir).recordImplementer(245, "claude-sonnet-5");
     assert.deepEqual(openRunState(dir).implementedBy(), {
-      "244": "gemini-3.8-flash-high (agy)",
+      "244": "gemini-3.8-flash-medium (agy)",
       "245": "claude-sonnet-5",
     });
+  }));
+
+/** Pins that a skipped implementer whose label was recorded earlier is preserved across runs (#993). */
+test("a recorded implementer label is kept when no new implementer runs", () =>
+  withDir((dir) => {
+    openRunState(dir).recordImplementer(244, "gemini-3.8-flash-medium (agy)");
+    // A second run skips the implementer, recording only a reviewer
+    openRunState(dir).recordReviewer(244, "claude-sonnet-5");
+    const state = openRunState(dir);
+    assert.equal(state.implementedBy()["244"], "gemini-3.8-flash-medium (agy)");
+    assert.equal(state.reviewedBy()["244"], "claude-sonnet-5");
+  }));
+
+/** Pins that a skipped reviewer whose label was recorded earlier is preserved across runs (#994). */
+test("a recorded reviewer label is kept when no new reviewer runs", () =>
+  withDir((dir) => {
+    openRunState(dir).recordReviewer(244, "claude-sonnet-5");
+    // A second run skips the reviewer, recording only an implementer
+    openRunState(dir).recordImplementer(244, "gemini-3.8-flash-medium (agy)");
+    const state = openRunState(dir);
+    assert.equal(state.reviewedBy()["244"], "claude-sonnet-5");
+    assert.equal(state.implementedBy()["244"], "gemini-3.8-flash-medium (agy)");
+  }));
+
+/** Pins that an issue's reviewer label is recorded and read back across handles. */
+test("a reviewer label is recorded and read back across handles", () =>
+  withDir((dir) => {
+    openRunState(dir).recordReviewer(244, "gemini-3.8-flash-medium (agy)");
+    const state = openRunState(dir);
+    assert.deepEqual(state.reviewedBy(), { "244": "gemini-3.8-flash-medium (agy)" });
+  }));
+
+/** Pins that each batch role's label is recorded on its own and read back across handles. */
+test("the merger's and the PR writer's labels are recorded and read back across handles", () =>
+  withDir((dir) => {
+    openRunState(dir).recordBatchRole("merger", "gemini-3.8-flash-medium (agy)");
+    openRunState(dir).recordBatchRole("pr-writer", "claude-sonnet-5");
+    const state = openRunState(dir);
+    assert.equal(state.batchRole("merger"), "gemini-3.8-flash-medium (agy)");
+    assert.equal(state.batchRole("pr-writer"), "claude-sonnet-5");
+  }));
+
+/** Pins that a batch role nothing has recorded reads as undefined, not as a Claude label. */
+test("an unrecorded batch role has no label", () =>
+  withDir((dir) => {
+    assert.equal(openRunState(dir).batchRole("merger"), undefined);
   }));
 
 /** Pins that a green tree is remembered across handles, and an unknown one is not green. */
@@ -137,3 +183,27 @@ test("a file without green trees reads with none", () =>
     state.recordGreenTree("abc");
     assert.equal(openRunState(dir).loadSession(1), "s");
   }));
+
+/** Pins that a spent Codex account does not gate the other accounts. */
+test("Codex quota resets are kept per account", () => {
+  withDir((dir) => {
+    const state = openRunState(dir);
+    state.useCodexAccount("antoni");
+    state.recordQuotaReset("codex", new Date("2026-11-18T00:00:00Z"));
+    assert.equal(state.readQuotaReset("codex")?.toISOString(), "2026-11-18T00:00:00.000Z");
+    state.useCodexAccount(undefined);
+    assert.equal(state.readQuotaReset("codex"), undefined);
+  });
+});
+
+/** Pins that a reading of another account is recorded under that account, leaving the one in use alone. */
+test("a Codex reset can be recorded under a named account other than the one in use", () => {
+  withDir((dir) => {
+    const state = openRunState(dir);
+    state.useCodexAccount("antoni");
+    state.recordQuotaReset("codex", new Date("2026-11-18T03:10:00Z"), "main");
+    assert.equal(state.readQuotaReset("codex"), undefined);
+    state.useCodexAccount("main");
+    assert.equal(state.readQuotaReset("codex")?.toISOString(), "2026-11-18T03:10:00.000Z");
+  });
+});

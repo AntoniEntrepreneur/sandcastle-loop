@@ -1,9 +1,13 @@
-// Unit tests for the run's usage table and log retention.
+// Test per-run accounting, rendered usage and independent log retention.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { AgentKind } from "./rolePlan.mts";
 
-import { formatUsageTable, logsToDelete, sessionUsage, type UsageRow } from "./runReport.mts";
+import { RunReport, formatUsageTable, logsToDelete, sessionUsage, streamStepUsage, type UsageRow } from "./runReport.mts";
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -90,7 +94,7 @@ test("usage table with no rows says nothing was used", () => {
 function agyRow(input: number, output: number, thinking: number, cacheRead: number): UsageRow {
   return {
     issue: "#244",
-    role: "gemini-3.8-flash-high",
+    role: "gemini-3.8-flash-medium",
     inputTokens: input,
     outputTokens: output,
     thinkingTokens: thinking,
@@ -99,9 +103,23 @@ function agyRow(input: number, output: number, thinking: number, cacheRead: numb
 }
 
 /** Pins that an agy row, built from the stream's result usage, shows all four token kinds (#731). */
-test("a gemini-3.8-flash-high row shows input, output, thinking and cache-read tokens", () => {
+test("a gemini-3.8-flash-medium row shows input, output, thinking and cache-read tokens", () => {
   const lines = formatUsageTable([agyRow(860, 215, 40, 300)]).split("\n");
-  assert.match(lines[1]!, /#244\s+gemini-3\.8-flash-high\s+1\s+860\s+215\s+40\s+300/);
+  assert.match(lines[1]!, /#244\s+gemini-3\.8-flash-medium\s+1\s+860\s+215\s+40\s+300/);
+});
+
+/** Pins that the PR writer's token row is labelled with its model rather than its role (#805). */
+test("the PR writer's token row is labelled with its model", () => {
+  const row: UsageRow = {
+    issue: "batch",
+    role: "gemini-3.8-flash-medium",
+    inputTokens: 1200,
+    outputTokens: 300,
+    thinkingTokens: 80,
+    cacheReadTokens: 150,
+  };
+  const lines = formatUsageTable([row]).split("\n");
+  assert.match(lines[1]!, /batch\s+gemini-3\.8-flash-medium\s+1\s+1200\s+300\s+80\s+150/);
 });
 
 /** Pins that a retried agy run's two attempts each get their own row, totalled once (#731, #810). */
@@ -113,9 +131,45 @@ test("a retried agy run shows each attempt's usage on its own row", () => {
     agyRow(600, 150, 20, 50),
   ]).split("\n");
   assert.equal(lines.length, 4);
-  assert.match(lines[1]!, /#244\s+gemini-3\.8-flash-high\s+1\s+500\s+100\s+10\s+0/);
-  assert.match(lines[2]!, /#244\s+gemini-3\.8-flash-high\s+2\s+600\s+150\s+20\s+50/);
+  assert.match(lines[1]!, /#244\s+gemini-3\.8-flash-medium\s+1\s+500\s+100\s+10\s+0/);
+  assert.match(lines[2]!, /#244\s+gemini-3\.8-flash-medium\s+2\s+600\s+150\s+20\s+50/);
   assert.match(lines[3]!, /Total\s+1100\s+250\s+30\s+50/);
+});
+
+/** Pins that an agy reviewer's resumed turn records only its difference, labelled with its model (#803). */
+test("an agy reviewer's resumed turn records only its difference, labelled with its model", () => {
+  const model = "gemini-3.8-flash-medium";
+  // The first turn ran under 200 lines with flash-medium.
+  const turn1Total = { inputTokens: 5000, outputTokens: 500, thinkingTokens: 100, cacheReadInputTokens: 1000 };
+  const turn1Spend = streamStepUsage(turn1Total);
+
+  // The resumed fix round reports cumulative totals from agy's stream.
+  const turn2Total = { inputTokens: 8000, outputTokens: 800, thinkingTokens: 150, cacheReadInputTokens: 2500 };
+  const turn2Spend = streamStepUsage(turn2Total, turn1Total);
+
+  const lines = formatUsageTable([
+    { issue: "#244", role: model, ...turn1Spend },
+    { issue: "#244", role: model, ...turn2Spend },
+  ]).split("\n");
+
+  assert.equal(lines.length, 4);
+  assert.match(lines[1]!, /#244\s+gemini-3\.8-flash-medium\s+1\s+5000\s+500\s+100\s+1000/);
+  assert.match(lines[2]!, /#244\s+gemini-3\.8-flash-medium\s+2\s+3000\s+300\s+50\s+1500/);
+  assert.match(lines[3]!, /Total\s+8000\s+800\s+150\s+2500/);
+});
+
+/** Pins that the merger's token row is labelled with its model (#804). */
+test("the merger's token row is labelled with its model", () => {
+  const row: UsageRow = {
+    issue: "batch",
+    role: "gemini-3.8-flash-medium",
+    inputTokens: 1200,
+    outputTokens: 300,
+    thinkingTokens: 50,
+    cacheReadTokens: 100,
+  };
+  const lines = formatUsageTable([row]).split("\n");
+  assert.match(lines[1]!, /batch\s+gemini-3\.8-flash-medium\s+1\s+1200\s+300\s+50\s+100/);
 });
 
 /** Pins that logs exactly 30 days old are kept, older ones deleted. */
@@ -133,3 +187,118 @@ test("logs exactly 30 days old are kept, older ones deleted", () => {
 test("no logs means nothing to delete", () => {
   assert.deepEqual(logsToDelete([], 0), []);
 });
+
+/** Pins shared issue/batch attribution and cumulative retry deltas through the report. */
+test("run report shares cumulative accounting between issue and batch steps", () => {
+  const report = new RunReport(0);
+  const agent = { kind: "agy", model: "gemini-3.8-flash-medium", label: "unused" } as const;
+  /** Build cumulative stream totals with separately reported thinking. */
+  const usage = (inputTokens: number, outputTokens: number, thinkingTokens: number, cacheReadInputTokens: number) => ({
+    inputTokens, outputTokens, thinkingTokens, cacheReadInputTokens, cacheCreationInputTokens: 0,
+  });
+  report.recordRoleUsage("#244", "reviewer", agent, [
+    { sessionId: "review", usage: usage(5000, 500, 100, 1000) }, {},
+  ]);
+  report.recordRoleUsage("#244", "reviewer", agent, [
+    { sessionId: "review", usage: usage(8000, 800, 150, 2500) },
+  ]);
+  report.recordRoleUsage("batch", "merger", agent, [
+    { sessionId: "merge", usage: usage(1200, 300, 50, 100) },
+  ]);
+  report.recordRoleUsage("batch", "prWriter", agent, [
+    { sessionId: "pr", usage: usage(600, 100, 20, 50) },
+  ]);
+  report.recordRoleUsage("batch", "prWriter", agent, [
+    { sessionId: "pr", usage: usage(800, 150, 30, 70) },
+    { usage: usage(10, 2, 1, 0) },
+  ]);
+  const lines = report.render().split("\n");
+  assert.equal(lines.length, 8);
+  assert.match(lines[1]!, /#244\s+gemini-3\.8-flash-medium\s+1\s+5000\s+500\s+100\s+1000/);
+  assert.match(lines[2]!, /#244\s+gemini-3\.8-flash-medium\s+2\s+3000\s+300\s+50\s+1500/);
+  assert.match(lines[3]!, /batch\s+gemini-3\.8-flash-medium\s+1\s+1200\s+300\s+50\s+100/);
+  assert.match(lines[4]!, /batch\s+gemini-3\.8-flash-medium\s+2\s+600\s+100\s+20\s+50/);
+  assert.match(lines[5]!, /batch\s+gemini-3\.8-flash-medium\s+3\s+200\s+50\s+10\s+20/);
+  assert.match(lines[6]!, /batch\s+gemini-3\.8-flash-medium\s+4\s+10\s+2\s+1\s+0/);
+  assert.match(lines[7]!, /Total\s+10010\s+1252\s+231\s+2670/);
+});
+
+/** Build a captured provider event with cache creation or separate reasoning usage. */
+function capturedUsage(kind: AgentKind, id: string, at: string, input: number, output: number, cached: number, extra: number): string {
+  if (kind === "claude") {
+    return JSON.stringify({
+      type: "assistant", timestamp: at,
+      message: { id, usage: {
+        input_tokens: input, cache_creation_input_tokens: extra,
+        output_tokens: output, cache_read_input_tokens: cached,
+      } },
+    });
+  }
+  return JSON.stringify({
+    type: "event_msg", timestamp: at,
+    payload: { type: "token_count", info: {
+      total_token_usage: { input_tokens: Number(id) },
+      last_token_usage: {
+        input_tokens: input, cached_input_tokens: cached,
+        output_tokens: output, reasoning_output_tokens: extra,
+      },
+    } },
+  });
+}
+
+for (const kind of ["claude", "codex"] as const) {
+  /** Pins capture cutoff, deduplication, retry rows and best-effort reads through the report. */
+  test(`run report accounts for ${kind} issue and batch captures best-effort`, () => {
+    const dir = mkdtempSync(join(tmpdir(), "run-report-"));
+    try {
+      const report = new RunReport(Date.parse("2026-11-15T20:00:00Z"));
+      const agent = { kind, model: "model", label: "gpt-6.1-sol medium (codex)" };
+      assert.equal(report.render(), "No agent usage was recorded this run.");
+      const firstPath = join(dir, "first.jsonl");
+      const retryPath = join(dir, "retry.jsonl");
+      const batchPath = join(dir, "batch.jsonl");
+      const first = capturedUsage(kind, "100", "2026-11-15T20:01:00Z", 100, 30, 40, kind === "claude" ? 20 : 10);
+      const retry = capturedUsage(kind, "150", "2026-11-15T20:02:00Z", 50, 7, 10, kind === "claude" ? 0 : 2);
+      const batch = capturedUsage(kind, "160", "2026-11-15T20:03:00Z", 10, 2, 3, kind === "claude" ? 0 : 1);
+      const old = capturedUsage(kind, "99", "2026-11-15T19:59:59Z", 999, 999, 999, 0);
+      writeFileSync(firstPath, [old, "not json", "{bad json", first, first].join("\n"));
+      writeFileSync(retryPath, [old, first, retry].join("\n"));
+      writeFileSync(batchPath, batch);
+      report.recordRoleUsage("#12", "implementer", agent, [
+        {}, { sessionFilePath: join(dir, "missing.jsonl") }, { sessionFilePath: dir },
+        { sessionFilePath: firstPath, usage: {
+          inputTokens: 99999, outputTokens: 99999, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+        } },
+      ]);
+      report.recordRoleUsage("#12", "implementer", agent, [{ sessionFilePath: retryPath }]);
+      report.recordRoleUsage("#12", "reviewer", agent, [{ sessionFilePath: retryPath }]);
+      report.recordRoleUsage("batch", "merger", agent, [{ sessionFilePath: batchPath }]);
+      report.recordRoleUsage("batch", "prWriter", agent, [{ sessionFilePath: batchPath }, { sessionFilePath: dir }]);
+      const cells = report.render().split("\n").map((line) => line.trim().split(/\s{2,}/));
+      if (kind === "claude") {
+        assert.deepEqual(cells.slice(1), [
+          ["#12", "implementer", "1", "120", "30", "0", "40"],
+          ["#12", "implementer", "2", "50", "7", "0", "10"],
+          ["#12", "reviewer", "1", "0", "0", "0", "0"],
+          ["batch", "merger", "1", "10", "2", "0", "3"],
+          ["batch", "prWriter", "1", "0", "0", "0", "0"],
+          ["Total", "180", "39", "0", "53"],
+        ]);
+      } else {
+        assert.deepEqual(cells.slice(1), [
+          ["#12", "gpt-6.1-sol medium (codex)", "1", "60", "20", "10", "40"],
+          ["#12", "gpt-6.1-sol medium (codex)", "2", "40", "5", "2", "10"],
+          ["#12", "gpt-6.1-sol medium (codex)", "3", "0", "0", "0", "0"],
+          ["batch", "gpt-6.1-sol medium (codex)", "1", "7", "1", "1", "3"],
+          ["batch", "gpt-6.1-sol medium (codex)", "2", "0", "0", "0", "0"],
+          ["Total", "107", "26", "13", "53"],
+        ]);
+      }
+      const nextRun = new RunReport(0);
+      nextRun.recordRoleUsage("batch", "merger", agent, [{ sessionFilePath: batchPath }]);
+      assert.match(nextRun.render(), kind === "claude" ? /Total\s+10\s+2\s+0\s+3/ : /Total\s+7\s+1\s+1\s+3/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}

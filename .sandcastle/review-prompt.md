@@ -23,13 +23,17 @@ The issue, its comments and its parent spec. Do not fetch them with `gh`.
 The full suite belongs to the orchestrator. It passed `{{CHECK_COMMAND}}` on
 this branch before the review started, and it runs the formatter and
 `{{CHECK_COMMAND}}` again after every change you make. Do not run the full
-suite, the linter or the formatter yourself.
+suite, the linter or the formatter yourself. Run targeted tests for the files
+you touched; the orchestrator runs the full check after you.
 
 {{CHECK_FAILURE}}
 
 # REVIEW PROCESS
 
 1. **Understand the change**: Read the issue, then the diff and commits above.
+   For each side the diff touches, read `backend/AGENTS.md` or
+   `frontend/AGENTS.md` first, because those files don't load on their own when
+   files are read through the shell.
 
 2. **Analyze for improvements**: Look for opportunities to:
    - Reduce unnecessary complexity and nesting
@@ -63,7 +67,9 @@ suite, the linter or the formatter yourself.
 If you find improvements to make:
 
 1. Make the changes directly on this branch
-2. Run the targeted test files for the code you changed, and nothing else
+2. Run the targeted test files for the code you changed, and nothing else: in
+   the foreground, under `timeout 480`, never moved to the background to wait
+   for them, because ten minutes without output kills this run
 3. Commit describing the refinements
 
 If the code is already clean and well-structured, do nothing, and run no tests.
