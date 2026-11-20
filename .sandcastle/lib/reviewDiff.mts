@@ -1,7 +1,15 @@
 // Reviewer cost controls: which model reviews a branch and whether the diff is
 // pasted whole. Pure functions over `git diff --numstat` text and token counts.
 
-/** Changed lines at which the reviewer moves from Sonnet to Opus. */
+import {
+  AGY_MEDIUM_MODEL,
+  CLAUDE_DEFAULT_MODEL,
+  CLAUDE_LARGE_REVIEW_MODEL,
+  CODEX_MODEL,
+  type AgentKind,
+} from "./rolePlan.mts";
+
+/** Changed lines at which the reviewer moves to its larger model: Sonnet to Opus, Sol to Astra. */
 export const OPUS_LINE_THRESHOLD = 200;
 
 /** Estimated tokens above which the reviewer gets a `--stat` summary. */
@@ -25,10 +33,20 @@ export function changedLines(numstat: string, lockfiles: string[], testFiles: re
 }
 
 /** The reviewer model for a diff of `lines` changed lines, with the reason. */
-export function chooseReviewerModel(lines: number): { model: string; reason: string } {
+export function chooseReviewerModel(
+  lines: number,
+  kind: AgentKind = "claude",
+): { model: string; reason: string } {
+  if (kind === "agy") {
+    return { model: AGY_MEDIUM_MODEL, reason: `${lines} changed lines, agy reviewer uses medium effort` };
+  }
+  const [small, large] =
+    kind === "codex"
+      ? [CODEX_MODEL.smallReview, CODEX_MODEL.largeReview]
+      : [CLAUDE_DEFAULT_MODEL, CLAUDE_LARGE_REVIEW_MODEL];
   return lines < OPUS_LINE_THRESHOLD
-    ? { model: "claude-sonnet-5", reason: `${lines} changed lines, under ${OPUS_LINE_THRESHOLD}` }
-    : { model: "claude-opus-5", reason: `${lines} changed lines, ${OPUS_LINE_THRESHOLD} or more` };
+    ? { model: small, reason: `${lines} changed lines, under ${OPUS_LINE_THRESHOLD}` }
+    : { model: large, reason: `${lines} changed lines, ${OPUS_LINE_THRESHOLD} or more` };
 }
 
 /** Rough token count: four characters per token. */

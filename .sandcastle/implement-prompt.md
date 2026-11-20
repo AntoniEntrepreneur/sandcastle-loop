@@ -65,6 +65,10 @@ the full history of this branch's own work):
 
 Explore the repo and fill your context window with relevant information that will allow you to complete the task.
 
+For each side the diff touches, read `backend/AGENTS.md` or `frontend/AGENTS.md`
+first, because those files don't load on their own when files are read through
+the shell.
+
 Pay extra attention to test files that touch the relevant parts of the code.
 
 # EXECUTION
@@ -86,6 +90,11 @@ it is right, commit it. Run the targeted tests afterwards and fix what they
 report in a follow-up commit. A commit is trivial to amend or revert; an
 uncommitted change is invisible to the orchestrator, which reads commits alone
 to decide whether you are making progress.
+
+**Run tests in the foreground, under `timeout 480`** (`timeout 480 npx vitest run
+path`), and wait for the command to return. Never move one to the background to
+wait for it: ten minutes without output kills this run. A command the limit
+stops has failed, so find the hang or narrow what you run.
 
 # THIRD-PARTY FACTS
 

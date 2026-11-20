@@ -11,6 +11,7 @@ test("pack-owned files are the loop and the engine patch, never the project's ow
     ".sandcastle/main.mts",
     ".sandcastle/lib/groups.mts",
     ".sandcastle/sandcastle.config.mts",
+    ".sandcastle/sandcastle.config.test.mts",
     ".sandcastle/Dockerfile",
     ".sandcastle/project-notes.md",
     ".sandcastle/CODING_STANDARDS.md",

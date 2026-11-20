@@ -24,6 +24,27 @@ test("200 changed lines goes to Opus", () => {
   assert.match(choice.reason, /200/);
 });
 
+/** Pins that under 200 changed lines uses flash-medium for agy. */
+test("under 200 changed lines uses flash-medium for agy", () => {
+  const choice = chooseReviewerModel(199, "agy");
+  assert.equal(choice.model, "gemini-3.8-flash-medium");
+  assert.match(choice.reason, /199/);
+});
+
+/** Pins that 200 changed lines still uses flash-medium for agy. */
+test("200 changed lines uses flash-medium for agy", () => {
+  const choice = chooseReviewerModel(200, "agy");
+  assert.equal(choice.model, "gemini-3.8-flash-medium");
+  assert.match(choice.reason, /200/);
+});
+
+/** Pins that a Codex reviewer moves from Sol to Astra at 200 changed lines, as Claude's moves to Opus. */
+test("a Codex reviewer runs gpt-6.1-sol under 200 changed lines and gpt-6-astra at 200", () => {
+  assert.equal(chooseReviewerModel(199, "codex").model, "gpt-6.1-sol");
+  assert.equal(chooseReviewerModel(200, "codex").model, "gpt-6-astra");
+  assert.match(chooseReviewerModel(200, "codex").reason, /200 or more/);
+});
+
 const LOCKFILES = ["package-lock.json", "frontend/package-lock.json", "uv.lock"];
 
 /** Pins that changed lines sum added and removed. */

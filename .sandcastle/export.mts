@@ -40,14 +40,14 @@ function run(command: string, args: string[], cwd?: string): string {
   return execFileSync(command, args, { cwd, encoding: "utf-8", maxBuffer: 64 * 1024 * 1024 }).trim();
 }
 
-/** A file's bytes as `SOURCE_REF` has it. */
+/** Read a file's bytes from the resolved source commit. */
 function sourceFile(path: string): Buffer {
-  return execFileSync("git", ["show", `${SOURCE_REF}:${path}`], { maxBuffer: 64 * 1024 * 1024 });
+  return execFileSync("git", ["show", `${sourceCommit}:${path}`], { maxBuffer: 64 * 1024 * 1024 });
 }
 
 run("git", ["fetch", "--quiet", "origin", "main"]);
 const sourceCommit = run("git", ["rev-parse", SOURCE_REF]);
-const tracked = run("git", ["ls-tree", "-r", "--name-only", SOURCE_REF, "--", ".sandcastle", "patches"]).split("\n");
+const tracked = run("git", ["ls-tree", "-r", "--name-only", sourceCommit, "--", ".sandcastle", "patches"]).split("\n");
 const files = packOwnedFiles(tracked);
 const projectFiles = PROJECT_OWNED_FILES.filter((path) => tracked.includes(path));
 const lock = JSON.parse(sourceFile("package-lock.json").toString("utf-8"));
@@ -91,8 +91,9 @@ function publish(clone: string, manifestPath: string, manifest: PackManifest, pr
   console.log("Running the loop's tests in the pack…");
   run("node", ["--test", ".sandcastle/lib/"], clone);
 
+  const historyPaths = [...new Set([...(previous?.files ?? []), ...manifest.files])];
   const commits = previous
-    ? run("git", ["log", "--format=%h%x09%s", `${previous.sourceCommit}..${sourceCommit}`, "--", ...files])
+    ? run("git", ["log", "--format=%h%x09%s", `${previous.sourceCommit}..${sourceCommit}`, "--", ...historyPaths])
         .split("\n")
         .filter(Boolean)
         .map((line) => {

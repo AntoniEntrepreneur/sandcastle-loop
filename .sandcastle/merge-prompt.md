@@ -3,7 +3,7 @@
 You are on a Sandcastle integration branch — NOT `main`; do not check out or
 touch `main`. The orchestrator has already run `git merge --no-ff` for every
 finished issue branch in this batch — or, when the branch is being brought up
-to date, for `origin/main` itself. You are called only because that left one
+to date, for `origin/main` itself or for the pushed copy of this branch. You are called only because that left one
 of two problems, and your job is to fix exactly those.
 
 ## Branches that did not merge cleanly
@@ -14,6 +14,11 @@ The orchestrator aborted these, so nothing of them is on this branch yet:
 
 For each one, run `git merge <branch> --no-ff --no-edit` and resolve the
 conflicts by reading both sides and choosing the correct resolution.
+
+When the branch is `origin/<this branch>` — the pushed copy of this very
+branch, which someone else added commits to — both sides are this PR's own
+work, often the same fix made twice. Keep both sides' intent, and where they
+make the same change keep one copy, not two.
 
 When the branch is `origin/main`, its side has already shipped: other PRs
 merged it after this branch was cut. Keep main's version of their work and
@@ -32,6 +37,10 @@ and fix what fails in a
 follow-up commit. A failure here usually means two branches built in parallel
 — or this branch and what main gained since — broke each other; fix the
 combination, do not revert either side's work.
+
+Sandcastle owns the installed dependencies: it installs and refreshes them.
+Do not reinstall dependencies yourself. If `.sandcastle/project-notes.md`
+names the project's dependency setup, read it there.
 
 # RULES
 

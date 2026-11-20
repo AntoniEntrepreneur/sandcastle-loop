@@ -5,6 +5,8 @@
 // — the circuit breaker, the quota match, the completion test — can be tested
 // without a sandbox or a quota. main.mts owns all git, gh and agent calls.
 
+import { isNonClaudeLabel } from "./rolePlan.mts";
+
 /** The admission label for an issue with no group: one issue, one PR. */
 export const SOLO_LABEL = "sandcastle";
 
@@ -61,13 +63,58 @@ function soloIssueOf(groupId: string): number | undefined {
  * printed `sandcastle:solo-365` — a label that does not exist and cannot be
  * created. It names the issue instead.
  *
- * Deliberately not shared with buildPrTitle, which renders the same group
- * differently on purpose: a PR title names the spec a group serves (`#218` for
- * `sandcastle:218`), while a message names the label (`sandcastle:218`).
+ * A PR title names the change instead (see buildPrTitle), and falls back to
+ * this only for a group with no issues to name it by.
  */
 export function describeGroup(groupId: string): string {
   const solo = soloIssueOf(groupId);
   return solo === undefined ? `${GROUP_LABEL_PREFIX}${groupId}` : `#${solo}`;
+}
+
+export type GroupResolution =
+  | { ok: true; groups: Group[] }
+  | { ok: false; message: string };
+
+/**
+ * Resolve typed ids against the board, keeping the typed order.
+ *
+ * An id is a group id (including `solo-N`) or a bare number: the group of that
+ * id if the board has one, else the solo issue. A number that is both is
+ * ambiguous. Nothing resolves unless every id does.
+ */
+export function resolveGroupIds(ids: readonly string[], board: readonly Group[]): GroupResolution {
+  const byId = new Map(board.map((group) => [group.id, group]));
+  const chosen: Group[] = [];
+  const unresolved: string[] = [];
+  const notes: string[] = [];
+  for (const id of ids) {
+    let found = byId.get(id);
+    if (/^\d+$/.test(id)) {
+      const solo = byId.get(`solo-${id}`);
+      if (found && solo) {
+        notes.push(`${id} is both the group ${GROUP_LABEL_PREFIX}${id} and the solo issue #${id} — it is ambiguous. Close one of them, or run solo-${id} for the solo issue.`);
+        continue;
+      }
+      found ??= solo;
+      if (!found) {
+        const inside = board.find((group) => group.issues.some((issue) => issue.number === Number(id)));
+        if (inside) {
+          notes.push(`#${id} is in group ${GROUP_LABEL_PREFIX}${inside.id} — run ${inside.id} instead`);
+          continue;
+        }
+      }
+    }
+    if (!found) unresolved.push(id);
+    else if (!chosen.includes(found)) chosen.push(found);
+  }
+  if (unresolved.length === 0 && notes.length === 0) return { ok: true, groups: chosen };
+  const lines = [...notes];
+  if (unresolved.length > 0) {
+    lines.push(`No Sandcastle group or solo issue matches ${unresolved.map((id) => JSON.stringify(id)).join(", ")}.`);
+  }
+  // Raw ids, not describeGroup's rendering: these are the strings you type.
+  lines.push(`Groups on the board: ${board.map((g) => g.id).join(", ") || "(none)"}`);
+  return { ok: false, message: lines.join("\n") };
 }
 
 /**
@@ -146,7 +193,7 @@ export function issueNumberOfBranch(branch: string): number | undefined {
  * Quota exhaustion and a broken login kill every group equally, so continuing
  * only burns container starts. Anything else is the group's own problem and
  * the next group deserves its turn. "shared" is never read from text: it is
- * every issue of a cycle failing alike (see sharedFailure).
+ * two issues failing alike back to back (see sharedFailure).
  */
 export type FailureKind = "quota" | "auth" | "network" | "shared" | "local";
 
@@ -208,7 +255,7 @@ export function agyErrorLine(text: string): string | undefined {
 }
 
 /**
- * What an agent said, out of stdout that may be `agy`'s event stream. That
+ * What an agent said, out of stdout that may be `agy`'s or Codex's event stream. That
  * stream carries every tool's output (`tool_info.output`), so a file the agent
  * merely read — this repo's own quota patterns, say — would read as a spent
  * quota. For an `agy` stream, only its final `result` (response and error)
@@ -216,6 +263,7 @@ export function agyErrorLine(text: string): string | undefined {
  */
 export function agentSaidText(stdout: string): string {
   const lines = stdout.split("\n");
+  if (lines.some((line) => CODEX_EVENT_LINE.test(line))) return codexSaidText(lines);
   if (!lines.some((line) => line.startsWith('{"event":'))) return stdout;
   const said: string[] = [];
   for (const line of lines) {
@@ -239,10 +287,79 @@ export function agentSaidText(stdout: string): string {
   return said.join("\n");
 }
 
+// A `codex exec --json` event line. Its names are the thread, turn and item
+// lifecycle `codex exec` prints, which Claude Code's stream never uses.
+const CODEX_EVENT_LINE = /^\{"type":"(?:thread\.started|turn\.(?:started|completed|failed)|item\.(?:started|updated|completed))"/;
+
+/**
+ * What a Codex agent said, out of its `codex exec --json` stream. The stream
+ * carries every command's output (`item.aggregated_output`), so only the
+ * agent's own messages, Codex's `error` events, a failed turn's error and any
+ * non-JSON line count, the same guard agy's stream gets above.
+ */
+function codexSaidText(lines: readonly string[]): string {
+  const said: string[] = [];
+  for (const line of lines) {
+    if (!line.startsWith("{")) {
+      said.push(line);
+      continue;
+    }
+    try {
+      const { type, item, message, error } = JSON.parse(line) as {
+        type?: string;
+        item?: { type?: string; text?: unknown };
+        message?: unknown;
+        error?: { message?: unknown };
+      };
+      if (type === "item.completed" && item?.type === "agent_message" && typeof item.text === "string") {
+        said.push(item.text);
+      } else if (type === "error" && typeof message === "string") {
+        said.push(message);
+      } else if (type === "turn.failed" && typeof error?.message === "string") {
+        said.push(error.message);
+      }
+    } catch {
+      // A truncated JSON line carries nothing to judge.
+    }
+  }
+  return said.join("\n");
+}
+
+// Codex's own usage-limit wording, e.g. "You've hit your usage limit. Upgrade
+// to Plus to continue using Codex (...), or try again at 3:20 PM." and the
+// `usage_limit_reached` error code. Distinct from Claude's QUOTA_PATTERNS
+// above, which say "usage limit reached", never "hit your usage limit".
+const CODEX_QUOTA_PATTERNS = [/hit your usage limit/i, /\busage_limit_reached\b/];
+
+/** Whether `text` names a spent Codex usage limit. */
+export function isCodexQuotaStop(text: string): boolean {
+  return CODEX_QUOTA_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+// Every way Codex 0.169.0 says a sign-in renewal failed (codex-rs/login, the
+// REFRESH_TOKEN_*_MESSAGE constants), e.g. "Your access token could not be
+// refreshed because your refresh token was already used. Please log out and
+// sign in again." A sandbox's sign-in has no refresh token (lib/codex.mts
+// sandboxAuth), so a renewal there always fails this way.
+const CODEX_AUTH_PATTERNS = [/access token could not be refreshed/i];
+
+/** Whether `text` names a Codex sign-in that could not be renewed. */
+export function isCodexAuthStop(text: string): boolean {
+  return CODEX_AUTH_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 // `agy`'s own credit/quota wording on an AGY_ERROR line (e.g. "Your AI
 // credits balance is too low to continue."), distinct from Claude's
 // QUOTA_PATTERNS above — "credits balance" there, not "credit balance".
-const AGY_QUOTA_PATTERNS = [/credits balance is too low/i, /insufficient credits/i, /out of credits/i];
+const AGY_QUOTA_PATTERNS = [
+  /credits balance is too low/i,
+  /insufficient credits/i,
+  /out of credits/i,
+  // "RESOURCE_EXHAUSTED (code 429): Individual quota reached. ... Resets in
+  // 2h2m19s." Unmatched, a solo group spent its remaining cycles on it (#820).
+  /quota reached/i,
+  /RESOURCE_EXHAUSTED/,
+];
 
 /**
  * Whether an AGY_ERROR line names a spent Gemini quota or credits balance, as
@@ -251,6 +368,14 @@ const AGY_QUOTA_PATTERNS = [/credits balance is too low/i, /insufficient credits
  */
 export function isAgyQuotaStop(line: string): boolean {
   return AGY_QUOTA_PATTERNS.some((pattern) => pattern.test(line));
+}
+
+/** When a quota stop saying "Resets in 2h2m19s" lifts, or undefined when it names no such time. */
+export function parseQuotaResetIn(text: string, now: Date): Date | undefined {
+  const match = text.match(/resets in (?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?/i);
+  if (!match || (!match[1] && !match[2] && !match[3])) return undefined;
+  const seconds = Number(match[1] ?? 0) * 3600 + Number(match[2] ?? 0) * 60 + Number(match[3] ?? 0);
+  return new Date(now.getTime() + seconds * 1000);
 }
 
 /** Quota, auth and network failures end the whole run; a local one ends only its group. */
@@ -412,13 +537,39 @@ export function checkFailureTail(
   return `The check timed out after ${CHECK_TIME_LIMIT_SECONDS / 60} minutes and was killed.\n\n${tail}`;
 }
 
+// What `gh` and `git` print on the host when GitHub cannot be reached (#999's
+// run: a Wi-Fi drop burned all three attempts within seconds, then the push).
+const GITHUB_UNREACHABLE = [
+  /error connecting to (?:api\.)?github\.com/i,
+  /Could not resolve host: (?:api\.)?github\.com/i,
+  /Failed to connect to (?:api\.)?github\.com/i,
+];
+
+/** Whether a failure is the host losing GitHub, which says nothing about the issue. */
+export function isGitHubUnreachable(text: string): boolean {
+  return GITHUB_UNREACHABLE.some((pattern) => pattern.test(text));
+}
+
 /**
- * What to do when the merger agent's run throws. Quota, auth and network
- * failures end the run; anything else, the SDK's idle timeout included, is
- * judged by the branch state the merger left behind.
+ * How long an agent may print nothing before the SDK kills it. The SDK's own
+ * default is 600s, which a full `make test` (~10 minutes, silent) can outlast:
+ * a Codex merger died mid-check on #1218's run. Half an hour is well past the
+ * longest silent command and still ends a genuinely wedged agent.
  */
-export function mergerFailureVerdict(errorText: string): "rethrow" | "judge-branch" {
-  return isRunFatal(classifyFailure(errorText)) ? "rethrow" : "judge-branch";
+export const AGENT_IDLE_TIMEOUT_SECONDS = 30 * 60;
+
+// npm's own error code when two sandboxes write the shared download cache at
+// once (EEXIST on a rename into _cacache, #990's run) or a tree it is replacing
+// (ENOTEMPTY). Anchored to npm's line, so a test merely printing one is no match.
+const INSTALL_RACE = /^npm (?:error|ERR!) code (?:EEXIST|ENOTEMPTY)$/m;
+
+/**
+ * Whether a red check died installing rather than testing: a race over the
+ * shared npm cache, which no change of the agent's caused or can fix. Worth one
+ * re-run before an agent is handed the output.
+ */
+export function isInstallRace(stdout: string, stderr: string): boolean {
+  return INSTALL_RACE.test(stderr) || INSTALL_RACE.test(stdout);
 }
 
 /**
@@ -453,7 +604,7 @@ export function isDeadRun(
  * dependent into the same PR.
  *
  * A plan is also exhausted when its issues settled with nothing to do (see
- * isSettledWithNothingToDo): the loop stops on that before replanning, so the
+ * isSettledWithNothingToDo): the queue stops on that without replanning, so the
  * last plan is still non-empty even though nothing in it is outstanding.
  */
 export function isGroupComplete(state: {
@@ -472,8 +623,34 @@ export interface DoneMarker {
   readonly batch: string;
 }
 
+/** An implementer-complete marker's trailer, parsed from one commit's message. */
+export interface ImplementerMarker {
+  readonly issue: number;
+}
+
+/** A reviewer-complete marker's trailer, parsed from one commit's message. */
+export interface ReviewerMarker {
+  readonly issue: number;
+}
+
+/** What the PR writer drafted: the body, and the title when it wrote one. */
+export interface WrittenPr {
+  readonly title?: string;
+  readonly body: string;
+}
+
+/** A PR-body marker, parsed from one commit's message. */
+export interface PrBodyMarker extends WrittenPr {
+  /** The integration branch the body was written for. */
+  readonly batch: string;
+}
+
 const DONE_TRAILER = /^Sandcastle-Done:\s*#(\d+)\s*$/m;
 const BATCH_TRAILER = /^Sandcastle-Batch:\s*(\S+)\s*$/m;
+const IMPLEMENTER_TRAILER = /^Sandcastle-Implementer:\s*#(\d+)\s*$/m;
+const REVIEWER_TRAILER = /^Sandcastle-Reviewer:\s*#(\d+)\s*$/m;
+const PR_BODY_TRAILER = /^Sandcastle-Pr-Body:\s*(\S+)\s*$/m;
+const PR_TITLE_TRAILER = /^Sandcastle-Pr-Title:[ \t]*(.+?)[ \t]*$/m;
 
 /**
  * Read a Done marker's trailers out of one commit message, or undefined if
@@ -485,6 +662,42 @@ export function parseDoneTrailers(commitMessage: string): DoneMarker | undefined
   const batchMatch = commitMessage.match(BATCH_TRAILER);
   if (!doneMatch || !batchMatch) return undefined;
   return { issue: Number(doneMatch[1]), batch: batchMatch[1] };
+}
+
+/**
+ * Read an implementer marker's trailer out of one commit message, or
+ * undefined if this commit does not carry it.
+ */
+export function parseImplementerTrailers(commitMessage: string): ImplementerMarker | undefined {
+  const match = commitMessage.match(IMPLEMENTER_TRAILER);
+  if (!match) return undefined;
+  return { issue: Number(match[1]) };
+}
+
+/**
+ * Read a reviewer marker's trailer out of one commit message, or
+ * undefined if this commit does not carry it.
+ */
+export function parseReviewerTrailers(commitMessage: string): ReviewerMarker | undefined {
+  const match = commitMessage.match(REVIEWER_TRAILER);
+  if (!match) return undefined;
+  return { issue: Number(match[1]) };
+}
+
+/**
+ * Read a PR-body marker out of one commit message, or undefined if this
+ * commit does not carry its trailer. The trailer alone makes it a marker; the
+ * body is whatever the orchestrator wrote between the subject and the trailer,
+ * and the title rides in its own trailer below it. A marker written before
+ * titles were recorded has none.
+ */
+export function parsePrBodyTrailers(commitMessage: string): PrBodyMarker | undefined {
+  const match = PR_BODY_TRAILER.exec(commitMessage);
+  if (!match) return undefined;
+  const aboveTrailer = commitMessage.slice(0, match.index).split("\n").slice(1);
+  const title = commitMessage.slice(match.index).match(PR_TITLE_TRAILER)?.[1];
+  const body = aboveTrailer.join("\n").trim();
+  return title ? { batch: match[1], title, body } : { batch: match[1], body };
 }
 
 /**
@@ -509,7 +722,7 @@ export function parseBlockedByLine(body: string | undefined): number[] {
  * resolved as far as this batch is concerned, even though GitHub still reports
  * its issue as open: a Sandcastle issue closes when the batch PR merges, not
  * when its commits land on the branch. Reading GitHub's state alone deadlocked
- * exactly the case the cycle loop exists for — a group whose blocker and
+ * exactly the case the group queue exists for — a group whose blocker and
  * dependent are both in the batch could never finish, because the dependent
  * waited on a close that waited on the PR that waited on the dependent.
  *
@@ -525,14 +738,24 @@ export function liveBlockers(
   return blockers.filter((blocker) => !merged.has(blocker));
 }
 
-/** Title the PR for a group's batch. */
-export function buildPrTitle(group: Group, mergedIssues: number): string {
-  const scope = group.parentIssue
-    ? `#${group.parentIssue}`
-    : group.id.startsWith("solo-")
-      ? `#${group.id.replace(/^solo-/, "")}`
-      : group.id;
-  return `Sandcastle: ${scope} — ${mergedIssues} issue(s)`;
+/**
+ * Title the PR for a group's batch when the PR writer wrote none: a draft
+ * batch, or a writer that left the title out.
+ *
+ * Follows the `pr` skill's title rule with the titles a human already wrote:
+ * a batch serving a parent spec takes the spec's title, and otherwise the
+ * first merged issue names it, with a count of the rest.
+ */
+export function buildPrTitle(
+  group: Group,
+  mergedIssues: { title: string }[],
+  parentTitle: string | undefined,
+): string {
+  if (parentTitle) return parentTitle;
+  const [first, ...rest] = mergedIssues.length > 0 ? mergedIssues : group.issues;
+  if (!first) return describeGroup(group.id);
+  if (rest.length === 0) return first.title;
+  return `${first.title}, and ${rest.length} more change${rest.length === 1 ? "" : "s"}`;
 }
 
 /**
@@ -551,16 +774,25 @@ export function buildPrTitle(group: Group, mergedIssues: number): string {
  * can pick a different implementer. `byIssue` holds the label recorded for an
  * issue, `fallback` names the rest — an issue merged before a run recorded its
  * implementer has no entry. Omitted, the lines are left out entirely.
+ *
+ * `reviewers` (by issue), `merger` and `prWriter` are the labels those roles
+ * recorded. They print only where agy or Codex ran, so a human reviewer knows
+ * which parts of the batch Gemini or Codex produced and an all-Claude batch's body is
+ * unchanged (#802).
  */
 export function buildPrBody(options: {
   group: Group;
   mergedIssues: { id: string; title: string }[];
-  blockedIssues: { id: string; title: string; blockedBy: number[] }[];
+  blockedIssues: { id: string; title: string; blockedBy: number[]; heldIn?: string; lookupError?: string }[];
   complete: boolean;
   writeup?: string;
   implementers?: { byIssue: Record<string, string>; fallback: string };
+  reviewers?: Record<string, string>;
+  merger?: string;
+  prWriter?: string;
 }): string {
-  const { group, mergedIssues, blockedIssues, complete, writeup, implementers } = options;
+  const { group, mergedIssues, blockedIssues, complete, writeup, implementers, reviewers = {}, merger, prWriter } =
+    options;
   const solo = soloIssueOf(group.id);
   const lines = [
     // A batch of one is not a batch, and there is no group label to name: a
@@ -576,12 +808,23 @@ export function buildPrBody(options: {
 
   if (mergedIssues.length > 0) {
     lines.push(...mergedIssues.map((i) => `Closes #${i.id}: ${i.title}`));
+    // One block for who ran what: every merged issue's implementer, then only
+    // the roles agy or Codex ran. Collected first so the blank line above them is
+    // written once, and not at all for a body that names nobody.
+    const byRole: string[] = [];
     if (implementers !== undefined) {
-      lines.push("");
-      lines.push(
+      byRole.push(
         ...mergedIssues.map((i) => `#${i.id}: implemented by ${implementers.byIssue[i.id] ?? implementers.fallback}`),
       );
     }
+    byRole.push(
+      ...mergedIssues
+        .filter((i) => isNonClaudeLabel(reviewers[i.id]))
+        .map((i) => `#${i.id}: reviewed by ${reviewers[i.id]}`),
+    );
+    if (isNonClaudeLabel(merger)) byRole.push(`Merged by ${merger}`);
+    if (isNonClaudeLabel(prWriter)) byRole.push(`PR body written by ${prWriter}`);
+    if (byRole.length > 0) lines.push("", ...byRole);
   } else {
     lines.push(
       "Carried forward from an earlier interrupted run; see the commits on this branch.",
@@ -592,10 +835,21 @@ export function buildPrBody(options: {
     lines.push("");
     lines.push("Excluded this batch — blocked:");
     lines.push(
-      ...blockedIssues.map(
-        (i) =>
-          `- #${i.id}: ${i.title} (blocked by ${i.blockedBy.map((n) => `#${n}`).join(", ")})`,
-      ),
+      // No blockers means the issue ran out of attempts rather than waiting on
+      // one, unless its branch is held by a foreign worktree or its lookup failed instead.
+      ...blockedIssues.map((i) => {
+        let reason: string;
+        if (i.heldIn !== undefined) {
+          reason = `checked out in foreign worktree ${i.heldIn}`;
+        } else if (i.lookupError !== undefined) {
+          reason = `blocker lookup failed: ${i.lookupError}`;
+        } else if (i.blockedBy.length > 0) {
+          reason = `blocked by ${i.blockedBy.map((n) => `#${n}`).join(", ")}`;
+        } else {
+          reason = "ran out of attempts";
+        }
+        return `- #${i.id}: ${i.title} (${reason})`;
+      }),
     );
   }
 
@@ -618,18 +872,23 @@ export function buildPrBody(options: {
   return lines.join("\n");
 }
 
+/** How one issue's work ended: failed, or the commits it made and whether it signalled completion. */
+export type IssueOutcome = { failed: boolean; commits: number; completed: boolean };
+
+/** One failure, as the shared-failure backstop compares them: the issue and its message. */
+export type IssueFailure = { issue: string; message: string };
+
 /**
- * Did a cycle prove there is nothing left for this group to do?
+ * Did every issue the run worked prove there is nothing left for this group to do?
+ * Pass each issue's final outcome, so an attempt that failed and was retried does not count.
  *
  * An issue that signals completion without producing a commit is telling us its
- * work was already done. When that holds for every issue in a cycle, replanning
- * can only produce the same answer, so the group is finished and further cycles
- * are pure waste. A failure, or an issue that never signalled, means the
- * opposite — a retry may still get somewhere.
+ * work was already done. When that holds for every issue that ran, replanning
+ * can only produce the same answer, so the group is finished. A failure, or an
+ * issue that never signalled, means the opposite — a retry may still get
+ * somewhere.
  */
-export function isSettledWithNothingToDo(
-  outcomes: { failed: boolean; commits: number; completed: boolean }[],
-): boolean {
+export function isSettledWithNothingToDo(outcomes: IssueOutcome[]): boolean {
   return (
     outcomes.length > 0 &&
     outcomes.every((o) => !o.failed && o.commits === 0 && o.completed)
@@ -637,33 +896,35 @@ export function isSettledWithNothingToDo(
 }
 
 /**
- * The message every planned issue failed with, when all of a cycle's issues
- * failed alike, or undefined.
+ * The message two back-to-back failures share, when they come from different
+ * issues, or undefined. `previous` is the failure just before `current` with
+ * no success between them.
  *
- * The backstop behind classifyFailure() at cycle level, as isDeadRun is at step
- * level: it needs no known wording. Independent issues failing identically
- * points at the machine, the login or the quota, not at the issues, so another
- * cycle would fail the same way (2026-10-28: five cycles lost to a quota message
- * no pattern matched). One issue proves nothing, so it takes two. Each message
- * has its own issue number masked before comparing.
+ * The backstop behind classifyFailure() at queue level, as isDeadRun is at step
+ * level: it needs no known wording. Different issues failing identically points
+ * at the machine, the login or the quota, not at the issues, so more work would
+ * fail the same way (2026-10-28: five cycles lost to a quota message no pattern
+ * matched). One issue proves nothing, so it takes two, and the same issue
+ * failing twice is its own problem. Each message has its own issue number
+ * masked before comparing.
  */
 export function sharedFailure(
-  failures: { issue: string; message: string }[],
-  planned: number,
+  previous: IssueFailure | undefined,
+  current: IssueFailure,
 ): string | undefined {
-  if (planned < 2 || failures.length !== planned) return undefined;
-  const masked = failures.map(({ issue, message }) =>
-    message.replace(new RegExp(`\\b${issue}\\b`, "g"), "<issue>"),
-  );
-  return masked.every((message) => message === masked[0]) ? failures[0]!.message : undefined;
+  if (!previous || previous.issue === current.issue) return undefined;
+  const mask = ({ issue, message }: { issue: string; message: string }) =>
+    message.replace(new RegExp(`\\b${issue}\\b`, "g"), "<issue>");
+  return mask(previous) === mask(current) ? current.message : undefined;
 }
 
 /**
- * Issues merged last cycle that this cycle planned again. A merge carries the
- * issue's Done marker, so the next plan should drop it; any that come back
- * mean the markers are going unseen, and every further cycle would re-work
- * finished issues (#855).
+ * Issues merged by this run that a plan lists again. A merge carries the
+ * issue's Done marker, so no later plan should hold it; any that come back
+ * mean the markers are going unseen, and the queue would re-work finished
+ * issues (#855). Compared against everything this run merged, not only the
+ * latest merge.
  */
-export function replannedAfterMerge(justMerged: readonly string[], planned: readonly string[]): string[] {
-  return planned.filter((id) => justMerged.includes(id));
+export function replannedAfterMerge(mergedThisRun: readonly string[], planned: readonly string[]): string[] {
+  return planned.filter((id) => mergedThisRun.includes(id));
 }

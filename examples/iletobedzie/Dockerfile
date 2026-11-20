@@ -52,6 +52,16 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 # ~/.local/bin/agy, already on PATH below.
 RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
 
+# Install the Codex CLI, unconditionally for the same reason as agy, into the
+# agent's own npm prefix so it lands on the PATH below. Pinned to the host's
+# version: the host computes the hash that trusts the sandbox's git-guard hook
+# (lib/codex.mts), and an older or newer sandbox Codex might hash it otherwise.
+# ~/.codex is made here, owned by the agent: Sandcastle mounts single files into
+# it, and a folder Docker creates for a mount belongs to root, which would stop
+# Codex writing its sessions there.
+RUN npm install -g --prefix /home/agent/.local @openai/codex@0.169.0 \
+  && mkdir -p /home/agent/.codex/sessions
+
 # Install uv: `make test` runs pytest through it, `make lint` runs black.
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 

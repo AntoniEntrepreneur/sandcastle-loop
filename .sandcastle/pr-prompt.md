@@ -3,14 +3,14 @@
 You are on a finished Sandcastle integration branch. Every issue in this batch
 is merged and the orchestrator has passed `{{CHECK_COMMAND}}` on this exact
 tree. The orchestrator is about to mark its PR ready for review, and you write
-the PR body a human reviewer reads.
+the PR title and body a human reviewer reads.
 
 These are the issues the batch covers:
 
 {{ISSUES}}
 
 Read what changed with `git log --format=%B {{BASE_REF}}..HEAD` and
-`git diff {{BASE_REF}}...HEAD`, then write the body with the `pr` skill.
+`git diff {{BASE_REF}}...HEAD`, then write the title and body with the `pr` skill (`.agents/skills/pr/SKILL.md`).
 
 Every commit's `Blockers or notes for next iteration` that names an unverified
 assumption or something left for a human goes under **Merge Danger**, in the
@@ -31,5 +31,6 @@ Read only. Do not commit, do not push, do not edit files, do not open or edit
 the PR, and do not close any issues. Do not add `Closes #…` lines: the
 orchestrator appends them below your body.
 
-Output the finished body between `<pr-body>` and `</pr-body>`, then
+Output the title between `<pr-title>` and `</pr-title>`, the finished body
+between `<pr-body>` and `</pr-body>`, then
 <promise>COMPLETE</promise>. Nothing else.

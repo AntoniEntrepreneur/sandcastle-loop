@@ -10,11 +10,13 @@ import {
   agySignInFiles,
   agySignInMounts,
   antigravity,
+  decodeGoKeyringValue,
   missingAgySignInFiles,
   parseGeminiQuotaReset,
+  stageAgyToken,
 } from "./antigravity.mts";
 
-const MODEL = "gemini-3.8-flash-high";
+const MODEL = "gemini-3.8-flash-medium";
 
 // `agy -p "/usage" > file`, recorded 2026-10-26 against `agy` 1.4.7: piped, so
 // the reset times are UTC. Gemini had quota left; Claude's weekly was spent.
@@ -68,7 +70,7 @@ test("parseGeminiQuotaReset reads unrecognised output as no reset", () => {
 
 // Trimmed from a real `agy` 1.4.6 run's stdout (#728).
 const STREAM_FIXTURE = [
-  '{"event":"init","conversation_id":"c-1","init":{"model":"gemini-3.8-flash-high","cwd":"/tmp","tools":["run_command"]}}',
+  '{"event":"init","conversation_id":"c-1","init":{"model":"gemini-3.8-flash-medium","cwd":"/tmp","tools":["run_command"]}}',
   '{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":1,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":6776,"output_tokens":765,"thinking_tokens":730,"cache_read_tokens":0,"total_tokens":7541}}}',
   '{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","output":"hello\\r\\n"}}}',
   '{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":3,"state":"DONE","step_type":"agent_response","text_delta":"hi\\n\\n<promise>COMPLETE</promise>\\n","usage":{"input_tokens":7618,"output_tokens":1904,"thinking_tokens":1895,"cache_read_tokens":0,"total_tokens":9522}}}',
@@ -132,7 +134,7 @@ test("buildPrintCommand carries the model, stream-json, stdin input and skip-per
   assert.match(command, /^agy --output-format/);
   assert.match(command, / -p "\$\(cat\)"$/);
   assert.match(command, /--output-format stream-json/);
-  assert.match(command, /--model 'gemini-3\.8-flash-high'/);
+  assert.match(command, /--model 'gemini-3\.8-flash-medium'/);
   assert.match(command, /--dangerously-skip-permissions/);
   assert.equal(stdin, "do the thing");
 });
@@ -145,7 +147,7 @@ test("buildPrintCommand resumes the given conversation with --conversation", () 
     resumeSession: "c-1",
   });
   assert.match(command, /^agy --conversation 'c-1' --output-format stream-json /);
-  assert.match(command, /--model 'gemini-3\.8-flash-high'/);
+  assert.match(command, /--model 'gemini-3\.8-flash-medium'/);
   assert.match(command, / -p "\$\(cat\)"$/);
   assert.equal(stdin, "fix the lint");
 });
@@ -214,28 +216,83 @@ test("agySignInFiles names the two sign-in files under the given home, nothing e
   });
 });
 
-/** Pins that a missing file is reported, by path, and a present one is not. */
-test("missingAgySignInFiles reports only the files that don't exist", () => {
-  const onlyTokenMissing = (path: string) => !path.endsWith("antigravity-oauth-token");
-  assert.deepEqual(missingAgySignInFiles("/home/dev", onlyTokenMissing), [
+/** Pins that missing credentials and an unstaged token are reported by host path, and present ones are not. */
+test("missingAgySignInFiles reports missing credentials and an unstaged token", () => {
+  assert.deepEqual(missingAgySignInFiles(true, "/home/dev", () => true), []);
+  assert.deepEqual(missingAgySignInFiles(false, "/home/dev", () => true), [
     "/home/dev/.gemini/antigravity-cli/antigravity-oauth-token",
   ]);
-  assert.deepEqual(missingAgySignInFiles("/home/dev", () => true), []);
-  assert.deepEqual(missingAgySignInFiles("/home/dev", () => false), [
+  assert.deepEqual(missingAgySignInFiles(false, "/home/dev", () => false), [
     "/home/dev/.gemini/oauth_creds.json",
     "/home/dev/.gemini/antigravity-cli/antigravity-oauth-token",
   ]);
 });
 
+const FAKE_TOKEN_JSON = '{"auth_method":"oauth","token":"fake"}';
+
+/** Pins go-keyring's two macOS wrappings, and that an unwrapped value passes through. */
+test("decodeGoKeyringValue unwraps base64 and hex go-keyring values", () => {
+  const base64 = `go-keyring-base64:${Buffer.from(FAKE_TOKEN_JSON).toString("base64")}`;
+  const hex = `go-keyring-encoded:${Buffer.from(FAKE_TOKEN_JSON).toString("hex")}`;
+  assert.equal(decodeGoKeyringValue(base64).toString("utf-8"), FAKE_TOKEN_JSON);
+  assert.equal(decodeGoKeyringValue(hex).toString("utf-8"), FAKE_TOKEN_JSON);
+  assert.equal(decodeGoKeyringValue(FAKE_TOKEN_JSON).toString("utf-8"), FAKE_TOKEN_JSON);
+});
+
+const STAGED = "/repo/.sandcastle/cache/agy-sign-in/antigravity-oauth-token";
+const HOST_TOKEN = "/home/dev/.gemini/antigravity-cli/antigravity-oauth-token";
+
+/** In-memory ports for stageAgyToken: a Keychain value, a file map, and a log of writes. */
+function stagingPorts(platform: NodeJS.Platform, keychain: string | undefined, files: Record<string, string>) {
+  const writes: { path: string; contents: string }[] = [];
+  return {
+    writes,
+    ports: {
+      platform,
+      readKeychain: () => keychain,
+      readFile: (path: string) => (path in files ? Buffer.from(files[path]!) : undefined),
+      writeFile: (path: string, contents: Buffer) => writes.push({ path, contents: contents.toString("utf-8") }),
+    },
+  };
+}
+
+const WRAPPED = `go-keyring-base64:${Buffer.from(FAKE_TOKEN_JSON).toString("base64")}`;
+
+/** Pins that a macOS Keychain sign-in is staged unwrapped, never at agy's own path (2026-11-10). */
+test("stageAgyToken stages the unwrapped Keychain value on macOS", () => {
+  const { writes, ports } = stagingPorts("darwin", WRAPPED, { [HOST_TOKEN]: "older file token" });
+  assert.equal(stageAgyToken(STAGED, "/home/dev", ports), true);
+  assert.deepEqual(writes, [{ path: STAGED, contents: FAKE_TOKEN_JSON }]);
+});
+
+/** Pins the fallback to agy's token file off macOS, or with no Keychain item. */
+test("stageAgyToken copies agy's token file when there is no Keychain value", () => {
+  for (const [platform, keychain] of [["linux", WRAPPED], ["darwin", undefined]] as const) {
+    const { writes, ports } = stagingPorts(platform, keychain, { [HOST_TOKEN]: FAKE_TOKEN_JSON });
+    assert.equal(stageAgyToken(STAGED, "/home/dev", ports), true);
+    assert.deepEqual(writes, [{ path: STAGED, contents: FAKE_TOKEN_JSON }]);
+  }
+});
+
+/** Pins that an unchanged token is not rewritten under a running sandbox's mount. */
+test("stageAgyToken leaves an up-to-date staged copy alone", () => {
+  const { writes, ports } = stagingPorts("darwin", WRAPPED, { [STAGED]: FAKE_TOKEN_JSON });
+  assert.equal(stageAgyToken(STAGED, "/home/dev", ports), true);
+  assert.deepEqual(writes, []);
+});
+
+/** Pins that with no source, an earlier staged copy still counts and none at all does not. */
+test("stageAgyToken with no token source keeps an earlier copy, else reports none", () => {
+  assert.equal(stageAgyToken(STAGED, "/home/dev", stagingPorts("linux", undefined, { [STAGED]: "x" }).ports), true);
+  assert.equal(stageAgyToken(STAGED, "/home/dev", stagingPorts("linux", undefined, {}).ports), false);
+});
+
 /** Pins the sandbox paths `agy` reads inside the container, and that the mounts are writable. */
-test("agySignInMounts maps both files to agy's sandbox paths, writable", () => {
-  const mounts = agySignInMounts("/home/dev");
+test("agySignInMounts maps the credentials and the staged token to agy's sandbox paths, writable", () => {
+  const mounts = agySignInMounts(STAGED, "/home/dev");
   assert.deepEqual(mounts, [
     { hostPath: "/home/dev/.gemini/oauth_creds.json", sandboxPath: "/home/agent/.gemini/oauth_creds.json" },
-    {
-      hostPath: "/home/dev/.gemini/antigravity-cli/antigravity-oauth-token",
-      sandboxPath: "/home/agent/.gemini/antigravity-cli/antigravity-oauth-token",
-    },
+    { hostPath: STAGED, sandboxPath: "/home/agent/.gemini/antigravity-cli/antigravity-oauth-token" },
   ]);
   for (const mount of mounts) assert.ok(!("readonly" in mount));
 });

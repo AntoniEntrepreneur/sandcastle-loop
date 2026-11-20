@@ -6,8 +6,10 @@
 // branch and its own PR, so two unrelated specs never share a review.
 //
 // Per group:
-//   Phase 0 (Sync + Pick up):   Merge origin/main into a resumed integration
-//                               branch that main has moved on from, so the PR
+//   Phase 0 (Sync + Pick up):   Merge the pushed copy of a resumed integration
+//                               branch that diverged from it (the merger agent
+//                               takes any conflict), then merge origin/main into it
+//                               when main has moved on, so the PR
 //                               is rebuilt on what already shipped. Then merge
 //                               `sandcastle/issue-<N>` branches belonging to
 //                               THIS group that a prior run left finished.
@@ -17,8 +19,9 @@
 //                               the body as a fallback. A blocker whose work is
 //                               already on the integration branch counts as
 //                               resolved, so a group that blocks itself drains
-//                               over successive cycles rather than waiting for
-//                               its own PR to merge. Anything still blocked is
+//                               as its issues merge rather than waiting for
+//                               its own PR to merge. Planning repeats after
+//                               every merge (lib/groupQueue.mts). Anything still blocked is
 //                               skipped, not attempted; there is no inferred
 //                               dependency graph and no fallback candidate
 //                               forced through when everything is blocked.
@@ -26,9 +29,11 @@
 //                               is driven one iteration at a time so a dead run
 //                               can be cut short; the reviewer follows if the
 //                               branch differs from the integration branch.
-//                               Issues run concurrently, and a cycle whose
-//                               issues all fail the same way ends the run.
-//   Phase 3 (Merge):            git merges the completed branches and the
+//                               An issue starts as soon as it is plannable;
+//                               there is no cycle to wait out.
+//   Phase 3 (Merge):            As soon as an issue carries its Done marker,
+//                               git merges its branch (together with any
+//                               others finished by then) and the
 //                               integration sandbox runs the project's
 //                               check. An agent is called only for a conflict
 //                               or a red result. Agents never start on a red
@@ -50,11 +55,17 @@
 //   npm run sandcastle              # every group and solo issue, in issue order
 //   npm run sandcastle -- 244       # one group only
 //   npm run sandcastle -- solo-365  # one solo issue only
+//   npm run sandcastle -- 278, 251, 555  # several groups, in the order typed
 //   npm run sandcastle -- refresh   # only merge main into every open batch PR
 //   npm run sandcastle -- prune     # delete local branches and worktrees whose work shipped
 //   npm run sandcastle -- --overnight               # leave it running; see below
 //   npm run sandcastle -- 244 --overnight --until 06:30
 //   npm run sandcastle -- 244 --implementer agy     # Gemini implements #244; see below
+//   npm run sandcastle -- 244 --reviewer agy        # Gemini reviews #244; see below
+//   npm run sandcastle -- 244 --merger agy          # Gemini resolves conflicts and repairs checks
+//   npm run sandcastle -- 244 --pr-writer agy       # Gemini writes the PR body; see below
+//   npm run sandcastle -- 244 --implementer codex   # Codex implements #244; see below
+//   npm run sandcastle -- 244 --reviewer codex --merger codex --pr-writer codex
 //   SANDCASTLE_DRY_RUN=1 npm run sandcastle
 //   SANDCASTLE_WAIT_FOR_QUOTA=1 npm run sandcastle  # sleep through quota stops, no end time
 //   SANDCASTLE_IGNORE_QUOTA_GATE=1 npm run sandcastle  # start before the recorded reset
@@ -62,14 +73,16 @@
 //   node --test .sandcastle/lib/    # unit tests for the logic below
 //
 // --overnight sleeps through quota stops (and a spent quota at startup) until
-// the reset, but never past the end time — 04:00 local unless --until says
+// the reset, but never past the end time — 05:00 local unless --until says
 // otherwise. After the end time, agent runs already going finish and are merged
 // and pushed; nothing new starts. A weekly limit or an empty credit balance
-// still ends the run. It also keeps the Mac awake (lid open, on power) and
-// mutes the end-of-run sound.
+// still ends the run. It also mutes the end-of-run sound.
+//
+// Every run keeps the Mac from idle-sleeping while it lives, on battery too.
+// Closing the lid still sleeps it.
 //
 // --implementer agy names an Antigravity (`agy`) agent running
-// gemini-3.8-flash-high (lib/antigravity.mts) as the implementer, and only
+// gemini-3.8-flash-medium (lib/antigravity.mts) as the implementer, and only
 // the implementer: the reviewer, merger and PR writer stay on Claude. Its
 // fix rounds and follow-up steps resume the conversation in the issue's
 // sandbox, but a dead agy run starts cold on its branch next time — the
@@ -87,24 +100,89 @@
 // folder (lib/antigravity.mts) — are mounted into the sandbox. Either file
 // missing on the host stops the run before any sandbox is built, naming
 // `agy` as the sign-in command. The exit token table labels its row
-// gemini-3.8-flash-high, with input, output, thinking and cache-read tokens
+// gemini-3.8-flash-medium, with input, output, thinking and cache-read tokens
 // read from the stream's own result usage; the PR body names the actual
 // implementer per issue, Claude or Gemini (lib/groups.mts, lib/runState.mts).
 //
-// The argument is always a group id, so what you can run by hand is decided by
-// the admission label. An issue carrying the bare `sandcastle` label is the
+// --reviewer agy names an Antigravity (`agy`) agent as the reviewer, running
+// gemini-3.8-flash-medium whatever the diff's size (lib/reviewDiff.mts). Every other role is
+// unaffected. Its fix rounds resume the reviewer's conversation inside the
+// issue's sandbox, but the conversation is never saved to the run state. An
+// unknown value stops the run before anything starts, naming the accepted
+// values. With --overnight it sleeps through a spent Gemini quota as a Gemini
+// quota stop. The exit token table labels its row with the model that actually
+// ran, and a resumed round records only its own difference; the PR body names
+// the reviewer when it ran on agy (#803).
+//
+// --merger agy runs conflict resolution and red-check repair on
+// gemini-3.8-flash-low (lib/rolePlan.mts). A thrown error carrying an
+// AGY_ERROR credits/quota line stops the run as a Gemini quota stop, while
+// non-quota errors are judged by what the merger left on the branch
+// (lib/issueLoop.mts). The merger's token row is labelled
+// gemini-3.8-flash-low, and the PR body names the merger when it ran on agy
+// (lib/groups.mts).
+//
+// --pr-writer agy drafts the batch's PR body on gemini-3.8-flash-low instead
+// of Claude; every other role is unaffected (#805). It extracts the body from
+// the stream's said text rather than raw stdout, and falls back to the generated
+// body if no body is output. A spent Gemini quota while writing stops the run
+// as a Gemini quota stop. The PR writer's token row comes from the stream and
+// is labelled gemini-3.8-flash-low; the PR body names the agy PR writer.
+//
+// --implementer, --reviewer, --merger and --pr-writer each also take codex,
+// which runs that role on Codex (`codex exec`, the engine's own provider): the
+// implementer on gpt-6.1-sol, the reviewer on gpt-6.1-sol under 200 changed
+// lines and gpt-6-astra at 200 or more, the merger and the PR writer on
+// gpt-6-luna (lib/rolePlan.mts).
+// --codex-account NAME runs every Codex role on ~/.codex-NAME; see
+// docs/agents/sandcastle.md. The PR body never names the account.
+// Agents mix per role: `--implementer codex --reviewer agy` is one run. It
+// needs `codex login` on the host: its sign-in is copied into each sandbox,
+// whose ~/.codex is Sandcastle's own, never the developer's (lib/codex.mts).
+// The copy has no refresh token, so no sandbox can spend the one-use token
+// the host's Codex depends on; instead the run renews the sign-in on the host
+// at the start when its access token has under two days left, and a sandbox
+// that still can't renew stops the run as a sign-in stop. A
+// linked worktree's Codex reads the project .codex/ from the main checkout,
+// which the sandbox doesn't mount, so the repo's Codex hooks and rules are
+// installed there at user level instead, and the hooks trusted by the hash the
+// host's Codex reports. A hook it can't trust stops the run before any sandbox
+// starts, since it would otherwise silently not run. The quota is read from
+// the host's `codex app-server`, which spends none of it: at the start, after
+// a shared failure, and on a Codex usage-limit stop, which --overnight sleeps
+// through on a clock of its own as it does Claude's and Gemini's. Only Claude
+// sessions are saved for a later run; a Codex one is resumed within its
+// sandbox only. The token table's Codex rows are named by label, e.g.
+// `gpt-6.1-sol medium (codex)`, read from the captured session file, and the PR
+// body names the roles Codex ran.
+//
+// Every agent shares one effort per role (ROLE_EFFORT in lib/rolePlan.mts):
+// medium for the implementer and the reviewer, low for the merger and the PR
+// writer. Claude and Codex take it as a setting, and agy as its model's
+// -medium/-low variant. Claude's labels name it too, e.g.
+// `claude-sonnet-5 medium` in the PR body.
+//
+// The startup banner and the dry-run plan name every role's agent and model,
+// read from the one role plan the whole run works from (lib/rolePlan.mts).
+//
+// Each argument is one or more group ids, split on commas and spaces
+// (`278 251`, `278,251` and `278, 251` are the same), duplicates dropped, run
+// in the order typed. An id is a group id, `solo-N`, or a bare N: the group N
+// if the board has one, else the solo issue #N; a number that is both is an
+// error. An id that resolves to nothing stops the run before any sandbox
+// starts, naming every such id. `refresh` takes no ids, and --overnight,
+// --until and the role flags apply to every chosen group. What you can run by
+// hand is decided by the admission label. An issue carrying the bare `sandcastle` label is the
 // group `solo-<its number>`, which is how you name it above. An issue inside a
 // `sandcastle:<id>` group has no handle of its own: the whole group is the
 // smallest thing a run will take, and the siblings you did not want cost a
 // sandbox each to report they have nothing to do.
 
 import * as sandcastle from "@ai-hero/sandcastle";
-import type { IterationResult, IterationUsage } from "@ai-hero/sandcastle";
 import { defaultImageName, docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { execFile, execFileSync, execSync, spawn } from "node:child_process";
 import {
   appendFileSync,
-  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -115,58 +193,96 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
+import { commandErrorText, loggedCommand } from "./lib/commandOutput.mts";
+import { ciHasPassedBase } from "./lib/ciGreen.mts";
+import { preflightDocker } from "./lib/dockerPreflight.mts";
+import { IntegrationSandbox } from "./lib/integrationSandbox.mts";
 import {
   catchUpWithRemote,
+  foreignWorktreeHolding,
   cleanTree,
   doneIssues,
+  hasImplementerComplete,
+  hasReviewerComplete,
   isBatchBranchShipped,
   isBehind,
   isStale,
   markDone,
-  mergeEach,
+  markImplementerComplete,
+  markReviewerComplete,
   prunableBranches,
   readyToMerge,
   saveWorktree,
   unfinishedBranches,
-  type IssueBranch,
+  type CatchUp,
 } from "./lib/gitFacts.mts";
 import {
   changedLines,
-  chooseReviewerModel,
   diffPresentation,
   estimateTokens,
 } from "./lib/reviewDiff.mts";
 import {
+  AGY_PROBE_MODEL,
+  formatRoleBanner,
+  roleLabel,
+  rolePlan,
+  type AgentKind,
+  type RoleEffort,
+} from "./lib/rolePlan.mts";
+import { createGitHubAccess } from "./lib/githubAccess.mts";
+import { runGroupQueue } from "./lib/groupQueue.mts";
+import { runGroup as runGroupWithPorts, refreshBranch } from "./lib/groupRun.mts";
+import {
   runIssueLoop,
   RunFatalError,
   throwIfRunFatal,
-  BranchStateError,
   runFatalStop,
   type IssueLoopPorts,
+  type Role,
   type RunResult,
 } from "./lib/issueLoop.mts";
 import {
   agySignInMounts,
-  agyThinkingTokens,
   antigravity,
   missingAgySignInFiles,
   parseGeminiQuotaReset,
+  stageAgyToken,
 } from "./lib/antigravity.mts";
+import {
+  appServerRequest,
+  accessTokenExpiry,
+  codexAuthFile,
+  codexQuotaStopMessage,
+  defaultCodexAccount,
+  missingCodexAccountMessage,
+  resolveCodexHome,
+  MIN_ACCESS_TOKEN_LIFE_MS,
+  renewHostCodexSignIn,
+  codexHookTrust,
+  CodexMissingError,
+  countHooks,
+  parseCodexRateLimits,
+  sandboxCodexConfig,
+  sandboxCodexMounts,
+  stageCodexAuth,
+  type CodexQuotaReading,
+} from "./lib/codex.mts";
 import { openRunState } from "./lib/runState.mts";
+import { withCheckSlot } from "./lib/checkSlots.mts";
 import { resumeRunOptions } from "./lib/resumeRun.mts";
 import {
   extractAvoidTerms,
-  extractPrBody,
   fillProjectPlaceholders,
   parentIssueNumber,
   renderIssueContext,
   type IssueText,
 } from "./lib/promptInputs.mts";
+import { inspectSandboxImage, prepareSandboxImage } from "./lib/sandboxImage.mts";
+import { formatUsageTable, logsToDelete, RunReport, sessionUsage, streamStepUsage, type UsageRow } from "./lib/runReport.mts";
 import { IMAGE_HASH_LABEL, computeImageHash } from "./lib/imageHash.mts";
-import { formatUsageTable, logsToDelete, sessionUsage, type UsageRow } from "./lib/runReport.mts";
 import { muteSounds, reportOutcome } from "./notify.mts";
 import { config } from "./sandcastle.config.mts";
 import {
@@ -180,44 +296,26 @@ import {
 } from "./lib/overnight.mts";
 import {
   batchBranchGlob,
-  batchBranchName,
-  buildPrBody,
-  buildPrTitle,
-  checkFailureTail,
-  mergerFailureVerdict,
   withTimeLimit,
   DEAD_ITERATION_THRESHOLD,
   describeGroup,
-  isGroupComplete,
+  AGENT_IDLE_TIMEOUT_SECONDS,
   type FailureKind,
-  isSettledWithNothingToDo,
   issueBranchName,
   issueNumberOfBranch,
-  liveBlockers,
   parseBlockedByLine,
   partitionIntoGroups,
+  resolveGroupIds,
   quotaGate,
-  replannedAfterMerge,
-  sharedFailure,
   shouldProbeQuota,
   type Group,
   type Issue,
+  type QuotaGateDecision,
 } from "./lib/groups.mts";
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
-
-// Plan→execute→merge cycles per group. The loop exists to pick up issues that
-// a merge unblocks, so it needs to cover the depth of a dependency chain, not
-// the size of the backlog — plus slack, because a cycle that produces no
-// commits still spends one. The deepest chain on the board when this was last
-// checked was four (#272,#273 → #277 → #278 → #279 under `sandcastle:262`), so
-// four exactly would drain that group only if nothing went wrong on the way.
-// Still deliberately small: with a finite quota, the constant that matters is
-// the one that stops a wedged group eating the night. Cycles are not spent
-// speculatively — the loop breaks as soon as nothing is plannable.
-const MAX_ITERATIONS = 6;
 
 // Upper bound on implementer iterations per issue. Driven one at a time from
 // here rather than handed to maxIterations, so the circuit breaker below can
@@ -239,6 +337,30 @@ const HOOK_TIMEOUT_MS = 20 * 60 * 1000;
 // the worktree afterwards. It all runs before the agent starts, so a lockfile
 // change the agent genuinely intends is unaffected.
 const SETUP_COMMAND = config.setupCommand;
+
+// Installs and checks are the memory peaks: nine sandboxes running `npm install`
+// or `make test` at once exceeded Docker's VM and the kernel OOM-killed some of
+// them. Only this many may be in those phases together; the rest wait their turn.
+const HEAVY_PHASE_SLOTS = Number(process.env.SANDCASTLE_HEAVY_SLOTS ?? 3);
+
+const heavyWaiters: Array<() => void> = [];
+let heavyRunning = 0;
+
+async function inHeavyPhase<T>(work: () => Promise<T>): Promise<T> {
+  if (heavyRunning >= HEAVY_PHASE_SLOTS) {
+    await new Promise<void>((resolve) => heavyWaiters.push(resolve));
+  } else {
+    heavyRunning++;
+  }
+  try {
+    return await work();
+  } finally {
+    // Hand the slot straight to the next waiter, so the count stays put.
+    const next = heavyWaiters.shift();
+    if (next) next();
+    else heavyRunning--;
+  }
+}
 
 const hooks = {
   sandbox: {
@@ -269,6 +391,15 @@ const PROBE_FAILURE_CHARS = 300;
 // runs cold against its own platform but stops re-downloading.
 const CACHE_DIR = ".sandcastle/cache";
 const runState = openRunState(CACHE_DIR);
+const CHECK_SLOTS_DIR = join(CACHE_DIR, "check-slots");
+const AGY_STAGED_TOKEN = resolve(CACHE_DIR, "agy-sign-in", "antigravity-oauth-token");
+// The sandbox's own ~/.codex, staged on the host (lib/codex.mts): a copy of the
+// sign-in, and a config that trusts the repo's Codex hooks at their sandbox path.
+const CODEX_STAGED_AUTH = resolve(CACHE_DIR, "codex-home", "auth.json");
+const CODEX_STAGED_CONFIG = resolve(CACHE_DIR, "codex-home", "config.toml");
+// Codex sessions captured out of the sandboxes, kept apart from the
+// developer's own ~/.codex/sessions so they never crowd `codex resume`.
+const CODEX_SESSIONS_DIR = resolve(CACHE_DIR, "codex-sessions");
 
 function sandboxProvider() {
   const mounts = config.cacheMounts.map(({ name, sandboxPath }) => {
@@ -277,15 +408,34 @@ function sandboxProvider() {
     return { hostPath, sandboxPath };
   });
   // Only these two files, never the whole ~/.gemini folder — see
-  // lib/antigravity.mts for which, and why they're writable (#730).
-  if (IMPLEMENTER === "agy") mounts.push(...agySignInMounts());
+  // lib/antigravity.mts for which, why the token is a staged copy, and why
+  // they're writable (#730).
+  if (ROLE_PLAN.needsAgySignIn) {
+    stageAgyToken(AGY_STAGED_TOKEN);
+    mounts.push(...agySignInMounts(AGY_STAGED_TOKEN));
+  }
+  // Re-staged at every sandbox open, so each copies the sign-in the host's own
+  // Codex keeps renewed, its refresh token blanked (lib/codex.mts sandboxAuth).
+  if (ROLE_PLAN.needsCodexSignIn) {
+    stageCodexAuth(CODEX_STAGED_AUTH);
+    mounts.push(
+      ...sandboxCodexMounts({
+        stagedAuth: CODEX_STAGED_AUTH,
+        stagedConfig: CODEX_STAGED_CONFIG,
+        hooksFile: resolve(config.codexHooksFile!),
+        rulesDir: config.codexRulesDir === undefined ? undefined : resolve(config.codexRulesDir),
+      }),
+    );
+  }
   return docker({
     mounts,
     // A long test suite outlasts Claude Code's 2-minute Bash default, which
     // moved it to the background: agents then polled it with `sleep` loops,
-    // and some went silent long enough for the 600s idle timeout to kill them.
-    // Commands now stay in the foreground, with 8 minutes to finish — under
-    // that idle timeout.
+    // and some went silent long enough for the idle timeout to kill them.
+    // Commands now stay in the foreground, with 8 minutes to finish. Both
+    // settings are Claude Code's own, so `agy` gets the same rule from the
+    // implement and review prompts instead, and Codex relies on
+    // AGENT_IDLE_TIMEOUT_SECONDS, which every agent run is given.
     env: {
       ...config.sandboxEnv,
       CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
@@ -307,6 +457,9 @@ const BASE_BRANCH = "main";
 // the local branch, and a stale local main would make shipped work look new.
 const BASE_REF = `origin/${BASE_BRANCH}`;
 
+// The only folder Sandcastle moves a branch inside; a checkout elsewhere is foreign.
+const WORKTREES_DIR = ".sandcastle/worktrees";
+
 const DRY_RUN = process.env.SANDCASTLE_DRY_RUN === "1";
 
 let commandLine: CommandLine;
@@ -317,47 +470,130 @@ try {
   process.exit(1);
 }
 
+
 // Quota gate (#506): a run started before the saved reset refuses unless
 // IGNORE is set; waiting makes the gate and a quota stop sleep until the reset.
 const IGNORE_QUOTA_GATE = process.env.SANDCASTLE_IGNORE_QUOTA_GATE === "1";
 const OVERNIGHT = commandLine.overnight;
 const WAIT_FOR_QUOTA = OVERNIGHT || process.env.SANDCASTLE_WAIT_FOR_QUOTA === "1";
 
-/** The model every Claude role runs, the implementer included while #725 lands. */
-const CLAUDE_MODEL = "claude-sonnet-5";
+/**
+ * Which agent and model each role runs this run (lib/rolePlan.mts). Every
+ * branch that used to ask whether the implementer is agy asks the plan
+ * instead: sign-in, mounts, quota, token rows, sessions and labels (#802).
+ */
+const ROLE_PLAN = rolePlan(commandLine);
 
-// --implementer agy (#729): names the implementer in the plan and adds its own
-// one-word quota probe below. The reviewer, merger and PR writer stay on
-// Claude regardless.
-const IMPLEMENTER = commandLine.implementer;
-const AGY_IMPLEMENTER_MODEL = "gemini-3.8-flash-high";
-/** Names this run's implementer in the PR body's "implemented by" line (#731). */
-const IMPLEMENTER_LABEL = IMPLEMENTER === "agy" ? `${AGY_IMPLEMENTER_MODEL} (agy)` : CLAUDE_MODEL;
+// The run's one Codex account (#1201): the flag, else $CODEX_ACCOUNT, and only
+// when a role is on Codex. Every host-side Codex step (sign-in check, renewal,
+// staging, quota reading, hook trust) reads $CODEX_HOME, so the resolved home is
+// exported once here.
+// A comma list names several accounts (#1233); the run starts on the first with quota and swaps on a quota stop (#1234).
+let CODEX_ACCOUNTS: string[] | undefined;
+try {
+  CODEX_ACCOUNTS = ROLE_PLAN.needsCodexSignIn
+    ? (commandLine.codexAccounts ?? defaultCodexAccount(process.env))
+    : undefined;
+} catch (error) {
+  console.error((error as Error).message);
+  process.exit(1);
+}
+// Changes when a quota stop swaps to another listed account (#1234).
+let CODEX_ACCOUNT: string | undefined = CODEX_ACCOUNTS?.[0];
+if (CODEX_ACCOUNT !== undefined) process.env.CODEX_HOME = resolveCodexHome(CODEX_ACCOUNT);
+// Each account has its own quota, so its reset time is saved apart from the others'.
+runState.useCodexAccount(CODEX_ACCOUNT);
 
-// Fail before any sandbox is built, not with a dead implementer later (#730):
-// the sign-in files are created by running `agy` once on the host, which
-// opens a browser for Google sign-in.
-if (IMPLEMENTER === "agy") {
-  const missing = missingAgySignInFiles();
+// Fail before any sandbox is built, not with a dead agent later (#730): the
+// sign-in files are created by running `agy` once on the host, which opens a
+// browser for Google sign-in. On macOS the token lives in the Keychain instead
+// of its file, and is staged from there.
+if (ROLE_PLAN.needsAgySignIn) {
+  const missing = missingAgySignInFiles(stageAgyToken(AGY_STAGED_TOKEN));
   if (missing.length > 0) {
     console.error(
-      `--implementer agy needs these sign-in files, missing on this machine:\n${missing
+      `${ROLE_PLAN.agyFlags.join(", ")} needs these sign-in files, missing on this machine:\n${missing
         .map((path) => `  ${path}`)
-        .join("\n")}\n\nRun \`agy\` once on the host and sign in with your Google account — it writes both files — then re-run Sandcastle.`,
+        .join("\n")}\n\nRun \`agy\` once on the host and sign in with your Google account — it writes these (on macOS, the token goes to the Keychain, which Sandcastle reads) — then re-run Sandcastle.`,
     );
     process.exit(1);
   }
 }
 
-// The implementer's agent, and only the implementer's — the reviewer, merger
-// and PR writer are built with sandcastle.claudeCode(CLAUDE_MODEL) directly,
-// unaffected by --implementer (#730).
-const IMPLEMENTER_AGENT =
-  IMPLEMENTER === "agy" ? antigravity(AGY_IMPLEMENTER_MODEL) : sandcastle.claudeCode(CLAUDE_MODEL);
+// The same for Codex, plus its hooks (lib/codex.mts): the sandbox never loads
+// the repo's project .codex/, so the dangerous-git hook is installed in the
+// sandbox's own ~/.codex and trusted there by its hash. A hook that can't be
+// trusted would silently not run, so the run stops instead.
+if (ROLE_PLAN.needsCodexSignIn) {
+  const fail = (message: string): never => {
+    console.error(`${ROLE_PLAN.codexFlags.join(", ")}: ${message}`);
+    process.exit(1);
+  };
+  // Every listed account must be able to sign in, so a later swap never lands on a dead one.
+  for (const account of CODEX_ACCOUNTS ?? []) {
+    const home = resolveCodexHome(account);
+    if (!existsSync(codexAuthFile(home))) fail(missingCodexAccountMessage(account, home));
+  }
+  if (!existsSync(codexAuthFile())) {
+    if (CODEX_ACCOUNT !== undefined) fail(missingCodexAccountMessage(CODEX_ACCOUNT, process.env.CODEX_HOME!));
+    fail(
+      `needs Codex's sign-in file, missing on this machine:\n  ${codexAuthFile()}\n\nRun \`codex login\` on the host, then re-run Sandcastle.`,
+    );
+  }
+  // The sandboxes get no refresh token (lib/codex.mts sandboxAuth), so the
+  // access token they get must outlast the run: renew it here when it won't.
+  const expiresAt = accessTokenExpiry(readFileSync(codexAuthFile(), "utf-8"));
+  if (expiresAt !== undefined && expiresAt.getTime() - Date.now() < MIN_ACCESS_TOKEN_LIFE_MS) {
+    if (DRY_RUN) {
+      console.log(`Codex sign-in: expires ${expiresAt.toISOString()} — a real run renews it on the host first.`);
+    } else {
+      console.log(`Codex sign-in expires ${expiresAt.toISOString()} — renewing it on the host…`);
+      try {
+        renewHostCodexSignIn();
+      } catch (error) {
+        fail(`could not renew Codex's sign-in — ${(error as Error).message}\n\nRun \`codex login\` on the host, then re-run Sandcastle.`);
+      }
+      const renewed = accessTokenExpiry(readFileSync(codexAuthFile(), "utf-8"));
+      if (renewed === undefined || renewed.getTime() - Date.now() < MIN_ACCESS_TOKEN_LIFE_MS) {
+        fail(`Codex's sign-in still expires ${renewed?.toISOString() ?? "at an unknown time"} after renewing it. Run \`codex login\` on the host, then re-run Sandcastle.`);
+      }
+    }
+  }
+  stageCodexAuth(CODEX_STAGED_AUTH);
+  if (config.codexHooksFile === undefined) {
+    fail("sandcastle.config.mts names no codexHooksFile, so Codex would run in the sandbox with no dangerous-git guard.");
+  }
+  const hooksFile = resolve(config.codexHooksFile!);
+  let trust: ReturnType<typeof codexHookTrust> | undefined;
+  try {
+    trust = codexHookTrust(hooksFile);
+  } catch (error) {
+    fail(`could not read the trust hash of ${config.codexHooksFile} from \`codex app-server\` — ${(error as Error).message}`);
+  }
+  const expected = countHooks(readFileSync(hooksFile, "utf-8"));
+  if (trust!.hooks.length !== expected) {
+    fail(
+      `Codex found ${trust!.hooks.length} of the ${expected} hook(s) in ${config.codexHooksFile}; the sandbox would run without them.`,
+    );
+  }
+  mkdirSync(dirname(CODEX_STAGED_CONFIG), { recursive: true });
+  writeFileSync(CODEX_STAGED_CONFIG, sandboxCodexConfig(trust!.hooks, trust!.standInHooksFile));
+}
 
-/** Whose quota this run spends, each gated on its own reset: Claude always, Gemini under --implementer agy. */
-const QUOTA_PROVIDERS: QuotaProvider[] = IMPLEMENTER === "agy" ? ["claude", "gemini"] : ["claude"];
-const PROVIDER_NAMES: Record<QuotaProvider, string> = { claude: "Claude", gemini: "Gemini" };
+/** The agent a role runs, from the kind, model and (unless agy) effort its plan names. */
+function roleAgent({ kind, model, effort }: { kind: AgentKind; model: string; effort?: RoleEffort }) {
+  if (kind === "agy") return antigravity(model);
+  if (kind === "codex") {
+    return sandcastle.codex(model, { effort, sessionStorage: { hostSessionsDir: CODEX_SESSIONS_DIR } });
+  }
+  return sandcastle.claudeCode(model, { effort });
+}
+
+const IMPLEMENTER_AGENT = roleAgent(ROLE_PLAN.implementer);
+
+/** Whose quota this run spends, each gated on its own reset: Claude when any role is Claude, Gemini when any role is agy, Codex when any role is Codex. */
+const QUOTA_PROVIDERS: readonly QuotaProvider[] = ROLE_PLAN.quotaProviders;
+const PROVIDER_NAMES: Record<QuotaProvider, string> = { claude: "Claude", gemini: "Gemini", codex: "Codex" };
 
 /** When an overnight run stops starting agents; undefined for any other run. */
 const END_AT = commandLine.until ? nextClockTime(commandLine.until, new Date()) : undefined;
@@ -380,31 +616,63 @@ function keepAwake(): void {
   child.unref();
 }
 
-if (OVERNIGHT) {
-  muteSounds();
-  if (!DRY_RUN) keepAwake();
-}
+if (!DRY_RUN) keepAwake();
+if (OVERNIGHT) muteSounds();
 
 /** A reset time as the developer's local clock reads it. */
 function localTime(at: Date): string {
   return at.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
+const RESUME_ADVICE: Record<Exclude<FailureKind, "local">, string> = {
+  quota: "Re-run Sandcastle when your quota resets.",
+  auth: "Log the agent in, then re-run Sandcastle.",
+  network: "Check the sandbox's connectivity, then re-run Sandcastle.",
+  shared: "Fix what the failure above names — the machine, a login or the quota, since every issue met it — then re-run Sandcastle.",
+};
+
+const githubAccess = createGitHubAccess({
+  now: Date.now,
+  sleep: async (ms) => { await new Promise((resolve) => setTimeout(resolve, ms)); },
+  reachable: async () => {
+    try {
+      await execFileAsync("gh", ["api", "rate_limit", "--silent"], { timeout: 30_000 });
+      return true;
+    } catch { return false; }
+  },
+  log: (message) => console.log(message),
+});
+const githubCall = githubAccess.run;
+const waitForGitHub = githubAccess.wait;
+
+/** Give pre-run GitHub failures the same network ending and resume advice as a running group. */
+async function startupGitHub<T>(call: () => T | Promise<T>): Promise<T> {
+  try {
+    return await githubCall(call);
+  } catch (error) {
+    const stop = runFatalStop(error);
+    if (!stop) throw error;
+    console.error(`\n${stop.message}\n\n${RESUME_ADVICE[stop.kind]} It will resume where it stopped.`);
+    reportOutcome("interrupted");
+    process.exit(2);
+  }
+}
+
 /** Fetch an issue and its comments on the host, as JSON. */
-function fetchIssueText(number: number): IssueText & { comments: string[] } {
+async function fetchIssueText(number: number): Promise<IssueText & { comments: string[] }> {
   const raw = JSON.parse(
-    sh(`gh issue view ${Number(number)} --json number,title,body,comments`),
+    await ghCommand(["issue", "view", String(number), "--json", "number,title,body,comments"]),
   ) as IssueText & { comments: { body: string }[] };
   return { ...raw, comments: raw.comments.map((c) => c.body) };
 }
 
 /** The issue, its comments and its parent spec, rendered for the implementer prompt. */
-function issueContextFor(number: number): string {
-  const issue = fetchIssueText(number);
+async function issueContextFor(number: number): Promise<string> {
+  const issue = await fetchIssueText(number);
   const parentNumber = parentIssueNumber(issue.body);
   return renderIssueContext({
     issue,
-    parent: parentNumber === undefined ? undefined : fetchIssueText(parentNumber),
+    parent: parentNumber === undefined ? undefined : await fetchIssueText(parentNumber),
   });
 }
 
@@ -438,7 +706,7 @@ const PROMPTS = (() => {
   };
 })();
 
-const REQUESTED_GROUP = commandLine.group;
+const REQUESTED_GROUPS = commandLine.groups;
 
 // ---------------------------------------------------------------------------
 // Run visibility: saved console log, log pruning, token-use table
@@ -476,69 +744,13 @@ for (const stream of [process.stdout, process.stderr]) {
   }) as typeof stream.write;
 }
 
-/** Tokens used by every agent step this run, for the table printed at exit. */
-const usageRows: UsageRow[] = [];
-const RUN_STARTED_MS = Date.now();
-/** Assistant message ids already in usageRows; a resumed session repeats them. */
-const countedMessages = new Set<string>();
-
-/**
- * Record the token use of one finished Claude step from its captured session.
- * The iteration's own `usage` is not read: it is the last message's context
- * window, not what the step spent (lib/runReport.mts).
- */
-function recordSessionUsage(issue: string, role: string, iterations: readonly IterationResult[]): void {
-  for (const { sessionFilePath } of iterations) {
-    if (!sessionFilePath) continue;
-    let jsonl: string;
-    try {
-      jsonl = readFileSync(sessionFilePath, "utf-8");
-    } catch {
-      continue;
-    }
-    usageRows.push({ issue, role, ...sessionUsage(jsonl, RUN_STARTED_MS, countedMessages) });
-  }
-}
-
-// Each `agy` conversation's running total so far. A resumed turn's result
-// usage is the whole conversation's total, so a step's spend is the difference.
-const agyConversationTotals = new Map<string, IterationUsage & { thinkingTokens: number }>();
-
-/**
- * Record the token use of one finished `agy` step from the totals its stream
- * reported (#731). `agy` copies no session to the host, so there is no JSONL
- * to dedupe against. A resumed conversation reports its cumulative usage
- * (checked against `agy` 1.4.6, #788), so each step records the difference from
- * the conversation's previous total.
- */
-function recordStreamUsage(issue: string, role: string, iterations: readonly IterationResult[]): void {
-  for (const { usage, sessionId } of iterations) {
-    if (!usage) continue;
-    const total = { ...usage, thinkingTokens: agyThinkingTokens(usage) };
-    const prev = sessionId ? agyConversationTotals.get(sessionId) : undefined;
-    if (sessionId) agyConversationTotals.set(sessionId, total);
-    usageRows.push({
-      issue,
-      role,
-      inputTokens: usage.inputTokens - (prev?.inputTokens ?? 0),
-      outputTokens: usage.outputTokens - (prev?.outputTokens ?? 0),
-      thinkingTokens: total.thinkingTokens - (prev?.thinkingTokens ?? 0),
-      cacheReadTokens: usage.cacheReadInputTokens - (prev?.cacheReadInputTokens ?? 0),
-    });
-  }
-}
-
-/** Record the implementer's token use, labelled and sourced by which agent ran. */
-function recordImplementerUsage(issue: string, iterations: readonly IterationResult[]): void {
-  if (IMPLEMENTER === "agy") recordStreamUsage(issue, AGY_IMPLEMENTER_MODEL, iterations);
-  else recordSessionUsage(issue, "implementer", iterations);
-}
+const runReport = new RunReport(Date.now());
 
 // One exit handler covers every way a run ends — success, empty, failed,
 // interrupted: print the usage table, then remove the prompt snapshot.
 process.on("exit", () => {
   try {
-    console.log(`\nToken use this run:\n${formatUsageTable(usageRows)}`);
+    console.log(`\nToken use this run:\n${runReport.render()}`);
   } catch {
     // Reporting must not mask what actually went wrong.
   }
@@ -555,7 +767,7 @@ process.on("exit", () => {
 
 /** Run a command and return its trimmed stdout. */
 function sh(command: string): string {
-  return execSync(command, { encoding: "utf-8" }).trim();
+  return loggedCommand(() => execSync(command, { encoding: "utf-8", stdio: "pipe" }).trim(), console.error);
 }
 
 /** Run a command, returning its stdout or undefined if it failed. */
@@ -563,23 +775,27 @@ function shQuiet(command: string): string | undefined {
   try {
     return execSync(command, {
       encoding: "utf-8",
-      stdio: ["pipe", "pipe", "ignore"],
+      stdio: "pipe",
     }).trim();
-  } catch {
+  } catch (error) {
+    if (command.startsWith("gh ")) console.error(commandErrorText(error));
     return undefined;
   }
 }
 
 const execFileAsync = promisify(execFile);
 
-/** Run `gh` with these args, returning its trimmed stdout or undefined if it failed. */
-async function ghQuiet(args: string[]): Promise<string | undefined> {
-  try {
-    const { stdout } = await execFileAsync("gh", args, { encoding: "utf-8" });
-    return stdout.trim();
-  } catch {
-    return undefined;
-  }
+/** Run a GitHub command through the shared outage policy, preserving its diagnostics. */
+async function ghCommand(args: string[]): Promise<string> {
+  return githubCall(async () => {
+    try {
+      const { stdout } = await execFileAsync("gh", args, { encoding: "utf-8" });
+      return stdout.trim();
+    } catch (error) {
+      console.error(commandErrorText(error));
+      throw error;
+    }
+  });
 }
 
 /** Split git's newline-delimited branch output into names. */
@@ -610,10 +826,8 @@ function assertSafeGroupId(id: string): void {
 // ---------------------------------------------------------------------------
 
 /** Fetch every open issue with its labels and body, in one call. */
-function fetchOpenIssues(): Issue[] {
-  const json = sh(
-    `gh issue list --state open --limit 200 --json number,title,body,labels`,
-  );
+async function fetchOpenIssues(): Promise<Issue[]> {
+  const json = await ghCommand(["issue", "list", "--state", "open", "--limit", "200", "--json", "number,title,body,labels"]);
   const raw = JSON.parse(json) as {
     number: number;
     title: string;
@@ -652,29 +866,33 @@ function fetchOpenIssues(): Issue[] {
  * with a single open native blocker, #345.
  *
  * Async so a group's issues are asked about at once: it is one round trip to
- * GitHub per issue, every cycle, and in sequence those added up.
+ * GitHub per issue, on every plan, and in sequence those added up.
  */
-async function fetchBlockers(issue: Issue): Promise<number[]> {
-  const native = await ghQuiet([
+async function fetchBlockers(
+  issue: Issue,
+  isOpen: (number: number) => Promise<boolean> = isIssueOpen,
+): Promise<number[]> {
+  const native = await ghCommand([
     "api",
     `repos/{owner}/{repo}/issues/${issue.number}/dependencies/blocked_by`,
     "--paginate",
     "--jq",
     '[.[] | select(.state=="open") | .number]',
   ]);
-  if (native !== undefined) {
-    const numbers = JSON.parse(native.length > 0 ? native : "[]") as number[];
-    if (numbers.length > 0) return numbers;
-  }
+  const numbers = JSON.parse(native.length > 0 ? native : "[]") as number[];
+  if (numbers.length > 0) return numbers;
 
   const candidates = parseBlockedByLine(issue.body);
-  const open = await Promise.all(candidates.map(isIssueOpen));
+  const open = await Promise.all(candidates.map(isOpen));
   return candidates.filter((_, i) => open[i]);
 }
 
-/** Whether an issue is still open, for validating a `Blocked by:` fallback line. */
+/** Read issue freshness without treating a failed lookup as a closed issue. */
 async function isIssueOpen(issueNumber: number): Promise<boolean> {
-  const state = await ghQuiet(["issue", "view", String(issueNumber), "--json", "state", "--jq", ".state"]);
+  const state = await ghCommand(["issue", "view", String(issueNumber), "--json", "state", "--jq", ".state"]);
+  if (state !== "OPEN" && state !== "CLOSED") {
+    throw new Error(`Could not read state of #${issueNumber}: ${state}`);
+  }
   return state === "OPEN";
 }
 
@@ -694,25 +912,14 @@ function commitsAhead(ref: string, branch: string): number {
   return Number(sh(`git rev-list --count ${ref}..${branch}`));
 }
 
-/** The group's issues, described as {issueNumber, branch} pairs for gitFacts. */
-function groupIssueBranchDescriptors(group: Group): IssueBranch[] {
-  return group.issues.map((issue) => ({
-    issueNumber: issue.number,
-    branch: issueBranchName(issue.number),
-  }));
-}
-
 /**
  * Merged PR head branches matching `glob`, for deciding whether a batch
  * branch shipped by squash merge rather than by ancestry. `gh` has no glob
  * search over head branch names, so every merged PR is fetched once and
  * filtered here.
  */
-function fetchMergedPrHeadBranches(glob: string): string[] {
-  const json = shQuiet(
-    `gh pr list --state merged --limit 200 --json headRefName --jq '[.[].headRefName]'`,
-  );
-  if (json === undefined) return [];
+async function fetchMergedPrHeadBranches(glob: string): Promise<string[]> {
+  const json = await ghCommand(["pr", "list", "--state", "merged", "--limit", "200", "--json", "headRefName", "--jq", "[.[].headRefName]"]);
 
   const parsed: unknown = JSON.parse(json);
   if (!Array.isArray(parsed) || !parsed.every((entry) => typeof entry === "string")) {
@@ -726,10 +933,8 @@ function fetchMergedPrHeadBranches(glob: string): string[] {
 }
 
 /** Head branches of every open Sandcastle PR into BASE_BRANCH, for `refresh`. */
-function openBatchPrBranches(): string[] {
-  const json = sh(
-    `gh pr list --state open --base ${BASE_BRANCH} --limit 100 --json headRefName --jq '[.[].headRefName]'`,
-  );
+async function openBatchPrBranches(): Promise<string[]> {
+  const json = await ghCommand(["pr", "list", "--state", "open", "--base", BASE_BRANCH, "--limit", "100", "--json", "headRefName", "--jq", "[.[].headRefName]"]);
   const parsed: unknown = JSON.parse(json);
   if (!Array.isArray(parsed) || !parsed.every((entry) => typeof entry === "string")) {
     throw new Error(`Unexpected 'gh pr list' output, expected a string array: ${json}`);
@@ -738,86 +943,24 @@ function openBatchPrBranches(): string[] {
 }
 
 /**
- * Resolve the integration branch for a group, resuming one if it exists.
- *
- * A run is resumable: a `sandcastle/batch-<id>-*` branch left by an earlier run
- * is continued so its work — and its PR — carry forward. A fresh branch is cut
- * from BASE_BRANCH only when this group has none outstanding. A branch counts
- * as shipped — and is never resumed — once BASE_REF has it as an ancestor, or
- * once a PR with that head branch has merged. The second case is what a squash
- * merge needs: it never makes the branch an ancestor of BASE_REF.
- *
- * A resumed branch is first caught up with its pushed copy, which may have
- * moved on without this machine — see catchUpWithRemote.
- */
-function resolveIntegrationBranch(group: Group): string {
-  execSync(`git fetch origin ${BASE_BRANCH}`, { stdio: "inherit" });
-  const glob = batchBranchGlob(group.id);
-  const mergedPrHeads = fetchMergedPrHeadBranches(glob);
-  const outstanding = branchesMatching(glob).find(
-    (branch) => !isBatchBranchShipped(REPO_CWD, branch, BASE_REF, mergedPrHeads),
-  );
-
-  // Neither branch is checked out on the host. Agents work on it in their own
-  // worktree — see IntegrationSandbox — and git refuses a worktree for a
-  // branch that is already checked out somewhere else.
-  if (outstanding) {
-    console.log(`\nResuming integration branch: ${outstanding}`);
-    catchUpIntegrationBranch(outstanding);
-    return outstanding;
-  }
-
-  const fresh = batchBranchName(group.id, Date.now());
-  sh(`git branch ${fresh} ${BASE_REF}`);
-  console.log(`\nCut integration branch: ${fresh}`);
-  return fresh;
-}
-
-/**
  * Bring a resumed integration branch level with `origin`. A branch that never
  * reached `origin` has nothing to fetch, so a failed fetch is not an error.
- * Throws on divergence, which fails only this group: publishing would be
- * rejected anyway, and which side to keep is a human's call.
+ * A divergence — each side has commits the other lacks — is not resolved here:
+ * `IntegrationSandbox.mergeRemoteCopy` merges the pushed copy in, and hands
+ * conflicts to the merger agent.
  */
-function catchUpIntegrationBranch(branch: string): void {
-  shQuiet(`git fetch --quiet origin ${branch}`);
-  const outcome = catchUpWithRemote(REPO_CWD, branch, `origin/${branch}`);
-  if (outcome === "fast-forwarded") {
-    console.log(`Fast-forwarded ${branch} to origin/${branch}.`);
+async function fetchAndCatchUp(branch: string): Promise<CatchUp> {
+  try {
+    await githubCall(() => sh(`git fetch --quiet origin ${branch}`));
+  } catch (error) {
+    if (!/couldn.t find remote ref/i.test(commandErrorText(error))) throw error;
   }
-  if (outcome === "diverged") {
-    throw new Error(
-      `${branch} and origin/${branch} have diverged: each has commits the other lacks. Merge or reset one onto the other by hand, then re-run Sandcastle.`,
-    );
-  }
-}
-
-/**
- * Which of the group's issues does the integration branch already cover?
- *
- * Driven by Done markers reachable from the integration branch, not by
- * ancestry or commit counts: an issue is merged once the orchestrator marked
- * it done, whether or not its branch produced a diff.
- */
-function resolveMergedIssues(
-  group: Group,
-  integrationBranch: string,
-): { id: string; title: string; branch: string }[] {
-  const titles = new Map(group.issues.map((i) => [i.number, i.title]));
-
-  return doneIssues(REPO_CWD, integrationBranch)
-    .filter((number) => titles.has(number))
-    .map((number) => ({
-      id: String(number),
-      title: titles.get(number) ?? `Issue #${number}`,
-      branch: issueBranchName(number),
-    }))
-    .sort((a, b) => Number(a.id) - Number(b.id));
+  return catchUpWithRemote(REPO_CWD, branch, `origin/${branch}`, WORKTREES_DIR);
 }
 
 /** Host path of the worktree Sandcastle keeps for a branch. */
 function worktreePathOf(branch: string): string {
-  return `.sandcastle/worktrees/${branch.replace(/\//g, "-")}`;
+  return `${WORKTREES_DIR}/${branch.replace(/\//g, "-")}`;
 }
 
 /** Whether a branch's worktree has uncommitted changes mid-edit. */
@@ -825,105 +968,6 @@ function worktreeIsDirty(branch: string): boolean {
   const status = shQuiet(`git -C ${worktreePathOf(branch)} status --porcelain`);
   // No worktree checked out for this branch means nothing is mid-edit.
   return status !== undefined && status.length > 0;
-}
-
-/**
- * Commit whatever a killed process left mid-edit in the group's issue
- * worktrees, before Phase 0 even looks at them. Nothing else runs between a
- * Ctrl-C and the next invocation of Sandcastle, so this is the only point
- * that ever sees that dirt.
- */
-function saveDirtyWorktreesAtGroupStart(group: Group): void {
-  for (const issue of group.issues) {
-    const branch = issueBranchName(issue.number);
-    const worktree = worktreePathOf(branch);
-    if (!existsSync(worktree)) continue;
-    if (!worktreeIsDirty(branch)) continue;
-
-    if (saveWorktree(worktree, issue.number, "found-dirty-at-start")) {
-      console.log(
-        `Saved #${issue.number}: ${branch} was left dirty by an interrupted run.`,
-      );
-    }
-  }
-}
-
-/**
- * Recreate an issue branch left pointing at content already on BASE_REF —
- * e.g. commits later squash-merged (#253, #258, #355, #356). Safe because a
- * stale branch holds nothing BASE_REF lacks.
- *
- * A dirty worktree is saved first rather than recreated out from under it:
- * the save gives the branch content of its own, so it is no longer stale —
- * it is kept, and called out by name here rather than left to the generic
- * "no Done marker yet" warning `warnAboutUnfinishedBranches` would otherwise
- * give it.
- */
-function recreateStaleBranches(
-  planned: { id: string; branch: string }[],
-  integrationBranch: string,
-): void {
-  for (const { id, branch } of planned) {
-    if (branchesMatching(branch).length === 0) continue;
-    if (!isStale(REPO_CWD, branch, BASE_REF)) continue;
-
-    if (worktreeIsDirty(branch)) {
-      const worktree = worktreePathOf(branch);
-      if (saveWorktree(worktree, Number(id), "found-dirty-at-start")) {
-        console.warn(
-          `#${id}: ${branch} was stale AND mid-edit — saved its loose changes instead of recreating it. Kept, not deleted; it will look unfinished until this issue's implementer or reviewer finishes.`,
-        );
-      }
-      continue;
-    }
-
-    // Git refuses `branch -f` on a branch checked out in a worktree, so a
-    // clean worktree left by an interrupted run is moved from inside instead.
-    const worktree = worktreePathOf(branch);
-    if (existsSync(worktree)) {
-      sh(`git -C ${worktree} reset --hard ${integrationBranch}`);
-    } else {
-      sh(`git branch -f ${branch} ${integrationBranch}`);
-    }
-    // A session saved against the old branch would resume into work that no longer exists.
-    runState.clearSession(Number(id));
-    console.log(
-      `#${id}: ${branch} was stale (its commits already reached ${BASE_BRANCH}, likely via a squash merge) — recreated from ${integrationBranch}.`,
-    );
-  }
-}
-
-/**
- * Report the group's work that is saved but not yet marked done.
- *
- * A branch lands here either because an implementer is still mid-issue, or
- * because it was interrupted before signalling completion — the save points
- * in gitFacts mean neither case loses work, so there is nothing to do by
- * hand. This just makes the omission loud at PR time.
- */
-function warnAboutUnfinishedBranches(
-  group: Group,
-  integrationBranch: string,
-): void {
-  const unfinished = unfinishedBranches(
-    REPO_CWD,
-    integrationBranch,
-    groupIssueBranchDescriptors(group),
-  );
-  if (unfinished.length === 0) return;
-
-  console.warn(
-    `\n⚠️  ${describeGroup(group.id)}: ${unfinished.length} branch(es) hold saved work with no Done marker yet:\n`,
-  );
-
-  for (const branch of unfinished) {
-    const ahead = commitsAhead(integrationBranch, branch);
-    const dirty = worktreeIsDirty(branch);
-    console.warn(
-      `  ${branch} — ${ahead} commit(s), ${dirty ? "currently mid-edit" : "idle, waiting for its implementer or reviewer to finish"}`,
-    );
-  }
-  console.warn(`\n  Nothing to do by hand — re-run Sandcastle and it will be continued.\n`);
 }
 
 // ---------------------------------------------------------------------------
@@ -935,20 +979,16 @@ function errorText(error: unknown): string {
   return error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
 }
 
-/** A thrown value's message without its stack, for comparing failures. */
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 /**
- * The stop for a cycle whose issues all failed with `message`. The quota is
- * probed first: a quota stop in wording no pattern knows reads as a shared
+ * The stop for issues that failed alike with `message` (the queue raises it
+ * when two issues fail alike back to back). The quota is probed first: a quota stop in wording no pattern knows reads as a shared
  * failure, and a probe that names it lets the run wait for the reset instead.
  */
 function sharedFailureStop(message: string): RunFatalError {
   const quotaStop =
-    probeQuota("claude", CLAUDE_PROBE_MODEL) ??
-    (IMPLEMENTER === "agy" ? probeQuota("agy", AGY_IMPLEMENTER_MODEL) : undefined);
+    (ROLE_PLAN.quotaProviders.includes("claude") ? probeQuota("claude", CLAUDE_PROBE_MODEL) : undefined) ??
+    (ROLE_PLAN.quotaProviders.includes("gemini") ? probeQuota("agy", AGY_PROBE_MODEL) : undefined) ??
+    (ROLE_PLAN.quotaProviders.includes("codex") ? probeCodexQuota() : undefined);
   return quotaStop ?? new RunFatalError("shared", message.slice(0, 300));
 }
 
@@ -956,287 +996,44 @@ function sharedFailureStop(message: string): RunFatalError {
 // The integration sandbox: checks and merges
 // ---------------------------------------------------------------------------
 
-/** An issue as the merge step names it: its number, title and branch. */
-type MergeCandidate = { id: string; title: string; branch: string };
-
 /**
- * One sandbox on the group's integration branch, opened on first use and kept
- * for the rest of the group, so its install is paid once rather than per merge.
+ * The group's integration sandbox (lib/integrationSandbox.mts), wired to this
+ * run's real Docker, SDK, git and check slots.
  *
  * It is always opened on the named integration branch. The bind-mount default
  * is the "head" strategy, which mounts the developer's own checkout: every
  * setup hook then ran against it, which replaced the Mac's node_modules with
- * Linux binaries, rewrote the lockfile, and let the
- * merger `git stash` the developer's working tree. A named branch gets a
- * worktree under .sandcastle/worktrees/ instead, exactly as an issue sandbox
- * always has.
+ * Linux binaries, rewrote the lockfile, and let the merger `git stash` the
+ * developer's working tree. A named branch gets a worktree under
+ * .sandcastle/worktrees/ instead, exactly as an issue sandbox always has.
  */
-class IntegrationSandbox {
-  #sandbox: sandcastle.Sandbox | undefined;
-  #knownGreen = false;
-
-  constructor(readonly branch: string) {}
-
-  async #open(): Promise<sandcastle.Sandbox> {
-    this.#sandbox ??= await sandcastle.createSandbox({
-      branch: this.branch,
-      sandbox: sandboxProvider(),
-      hooks,
-    });
-    return this.#sandbox;
-  }
-
-  /** Run the project's check, unless this exact tree already passed it; the tail of its output if it failed. */
-  async #check(): Promise<string | undefined> {
-    const sandbox = await this.#open();
-    const tree = cleanTree(sandbox.worktreePath);
-    if (tree !== undefined && runState.isGreenTree(tree)) {
-      console.log(`${this.branch} already passed ${config.checkCommand} at this tree — not checking it again.`);
-      this.#knownGreen = true;
-      return undefined;
-    }
-    console.log(`Checking ${this.branch} with ${config.checkCommand}…`);
-    const result = await sandbox.exec(withTimeLimit(CHECK_COMMAND));
-    this.#knownGreen = result.exitCode === 0;
-    if (this.#knownGreen && tree !== undefined) runState.recordGreenTree(tree);
-    return checkFailureTail(result.exitCode, result.stdout, result.stderr, CHECK_OUTPUT_TAIL_CHARS);
-  }
-
-  /**
-   * Refuse to start agents on a red integration branch. Each of them would meet
-   * the same failure, take it for its own, and spend its turn on it: after #435
-   * shipped a broken import, every merger rediscovered and re-fixed it on its
-   * own branch until main was repaired by hand.
-   */
-  async assertGreen(): Promise<void> {
-    if (this.#knownGreen) return;
-    const failure = await this.#check();
-    if (failure === undefined) return;
-    throw new BranchStateError(
-      `${this.branch} fails ${config.checkCommand} before any agent has worked on it this cycle. Fix it by hand — on main, if the branch was cut from a red main — then re-run Sandcastle.\n\n${failure}`,
-    );
-  }
-
-  /**
-   * Merge finished issue branches into the integration branch.
-   *
-   * git does the merging and the sandbox runs the checks; an agent is called
-   * only when one of them fails — a conflict to resolve, or branches that
-   * merge cleanly but are red together because siblings built in parallel
-   * broke each other. Throws when the agent leaves either problem behind, so a
-   * red batch is never published.
-   */
-  async merge(issues: MergeCandidate[]): Promise<void> {
-    if (issues.length === 0) return;
-    await this.#mergeAndRepair(
-      issues.map((issue) => issue.branch),
-      issues.map((issue) => `- ${issue.id}: ${issue.title}`).join("\n"),
-      () =>
-        readyToMerge(
-          REPO_CWD,
-          this.branch,
-          issues.map((issue) => ({ issueNumber: Number(issue.id), branch: issue.branch })),
-        ),
-    );
-  }
-
-  /**
-   * Merge BASE_REF into the integration branch when main has moved on since
-   * the branch was cut, so this PR is rebuilt on what has already shipped
-   * rather than conflicting with it at merge time. Conflicts and red checks go
-   * to the merger agent exactly as an issue merge's do. A no-op — no sandbox
-   * opened — for a branch already level with main. True when it merged.
-   */
-  async syncWithBase(issueList: string): Promise<boolean> {
-    if (!isBehind(REPO_CWD, this.branch, BASE_REF)) return false;
-    console.log(`\n${this.branch} is behind ${BASE_REF} — merging it in…`);
-    await this.#mergeAndRepair([BASE_REF], issueList, () =>
-      isBehind(REPO_CWD, this.branch, BASE_REF) ? [BASE_REF] : [],
-    );
-    console.log(`${this.branch} is up to date with ${BASE_REF}.`);
-    return true;
-  }
-
-  /**
-   * git merges `branches`, the sandbox checks the result, and the merger agent
-   * is called only for a conflict or a red check. `stillUnmergedAfter` names what
-   * the agent failed to merge; anything left there, or a red check, throws.
-   */
-  async #mergeAndRepair(
-    branches: string[],
-    issueList: string,
-    stillUnmergedAfter: () => string[],
-  ): Promise<void> {
-    const sandbox = await this.#open();
-
-    const { merged, conflicted, conflictFiles } = mergeEach(sandbox.worktreePath, branches);
-    const conflictLine = (branch: string) => `${branch} (in ${conflictFiles[branch]?.join(", ") || "unknown files"})`;
-    for (const branch of merged) console.log(`  merged ${branch}`);
-    for (const branch of conflicted) console.log(`  ${conflictLine(branch)} conflicts — handing it to the merger agent`);
-
-    // With a conflict outstanding the agent runs the checks itself once it has
-    // resolved it, so checking the half-merged batch here would be wasted.
-    const failure = conflicted.length === 0 ? await this.#check() : undefined;
-    if (conflicted.length === 0 && failure === undefined) return;
-
-    this.#knownGreen = false;
-    try {
-      const result = await sandbox.run({
-        name: "merger",
-        maxIterations: 1,
-        agent: sandcastle.claudeCode(CLAUDE_MODEL),
-        promptFile: PROMPTS.merge,
-        promptArgs: {
-          CONFLICTED:
-            conflicted.length > 0
-              ? conflicted.map((branch) => `- ${conflictLine(branch)}`).join("\n")
-              : "(none — every branch merged cleanly)",
-          ISSUES: issueList,
-          CHECK_OUTPUT: failure ?? "(not run yet — run them yourself once the merges are done)",
-        },
-      });
-      recordSessionUsage("batch", "merger", result.iterations);
-      throwIfRunFatal(result.stdout);
-    } catch (error) {
-      if (error instanceof RunFatalError) throw error;
-      if (mergerFailureVerdict(errorText(error)) === "rethrow") {
-        throwIfRunFatal(errorText(error));
-      }
-      // Idle timeout or another local failure: its committed merges may be
-      // finished, so the branch-state checks below decide.
-      console.log(`  the merger agent failed (${errorText(error).slice(0, 200)}) — judging it by what it left`);
-    }
-
-    const stillUnmerged = stillUnmergedAfter();
-    const stillRed = await this.#check();
-    if (stillUnmerged.length === 0 && stillRed === undefined) return;
-
-    throw new BranchStateError(
-      [
-        `The merger agent left ${this.branch} unfinished. Nothing was pushed; resolve it by hand, then re-run Sandcastle.`,
-        stillUnmerged.length > 0 ? `Still unmerged: ${stillUnmerged.join(", ")}` : "",
-        stillRed ?? "",
-      ]
-        .filter(Boolean)
-        .join("\n\n"),
-    );
-  }
-
-  /**
-   * Have the PR writer draft the reviewer-facing body with the `pr` skill.
-   *
-   * Only called once the group is complete: a draft is not worth a reviewer's
-   * time, so it is not worth an agent's either. Undefined when the writer
-   * fails or writes nothing, and the PR falls back to the generated body — a
-   * missing writeup is no reason to hold back a finished batch.
-   */
-  async writePrBody(issueList: string): Promise<string | undefined> {
-    console.log(`\nWriting the PR body for ${this.branch} with the pr skill…`);
-    try {
-      const sandbox = await this.#open();
-      const result = await sandbox.run({
-        name: "pr-writer",
-        maxIterations: 1,
-        agent: sandcastle.claudeCode(CLAUDE_MODEL),
-        promptFile: PROMPTS.pr,
-        promptArgs: { ISSUES: issueList, BASE_REF },
-      });
-      recordSessionUsage("batch", "pr-writer", result.iterations);
-      const body = extractPrBody(result.stdout);
-      if (body === undefined) console.log("  the PR writer output no body — keeping the generated one");
-      return body;
-    } catch (error) {
-      console.log(`  the PR writer failed (${errorText(error).slice(0, 200)}) — keeping the generated body`);
-      return undefined;
-    }
-  }
-
-  async close(): Promise<void> {
-    await this.#sandbox?.close();
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Phase 0: pick up finished work from a prior run
-// ---------------------------------------------------------------------------
-
-/**
- * Merge this group's branches that a prior run finished but never merged —
- * "finished" meaning carrying a Done marker for this integration branch, not
- * merely carrying commits. A branch with agent commits but no marker is left
- * alone: it is unfinished, not ready, however far it got.
- */
-async function pickUpPriorWork(
-  group: Group,
-  integration: IntegrationSandbox,
-): Promise<void> {
-  const ready = new Set(
-    readyToMerge(REPO_CWD, integration.branch, groupIssueBranchDescriptors(group)),
+function createIntegrationSandbox(branch: string): IntegrationSandbox {
+  return new IntegrationSandbox(
+    branch,
+    {
+      openSandbox: (onBranch) =>
+        sandcastle.createSandbox({ branch: onBranch, sandbox: sandboxProvider(), hooks }),
+      agentFor: (role) => roleAgent(role),
+      withCheckSlot: (work, onWait) => withCheckSlot(CHECK_SLOTS_DIR, work, { onWait }),
+      ciHasPassedBase: (tree) => ciHasPassedBase(tree, BASE_REF, shQuiet),
+      runState,
+      recordRoleUsage: (role, agent, iterations) =>
+        runReport.recordRoleUsage("batch", role, agent, iterations),
+    },
+    {
+      cwd: REPO_CWD,
+      baseRef: BASE_REF,
+      refreshDepsCommand: config.refreshDepsCommand,
+      check: {
+        command: withTimeLimit(CHECK_COMMAND),
+        label: config.checkCommand,
+        tailChars: CHECK_OUTPUT_TAIL_CHARS,
+      },
+      prompts: PROMPTS,
+      rolePlan: ROLE_PLAN,
+      log: (message) => console.log(message),
+    },
   );
-  const pickedUp = group.issues
-    .map((issue) => ({
-      id: String(issue.number),
-      title: issue.title,
-      branch: issueBranchName(issue.number),
-    }))
-    .filter(({ branch }) => ready.has(branch));
-
-  if (pickedUp.length === 0) return;
-
-  console.log(`\nPicking up ${pickedUp.length} branch(es) from a prior run:`);
-  for (const { id, title, branch } of pickedUp) {
-    console.log(`  ${id}: ${title} → ${branch}`);
-  }
-
-  await integration.merge(pickedUp);
-  console.log("\nPrior-run branches merged into integration branch.");
-}
-
-// ---------------------------------------------------------------------------
-// Phase 1: plan
-// ---------------------------------------------------------------------------
-
-/**
- * Split the group's remaining issues into what can run now and what is
- * blocked, by checking each one deterministically rather than inferring a
- * dependency graph. Applies the same way to a solo group's single issue as to
- * a multi-issue group — a blocked solo issue simply comes back with nothing
- * planned and itself in `blocked`.
- *
- * `alreadyMerged` does double duty: it drops the issues this batch has already
- * done, and it satisfies blockers pointing at them, so a group whose own
- * members block each other drains over successive cycles instead of stalling on
- * issues GitHub will only close when the batch PR merges.
- */
-async function planGroup(
-  group: Group,
-  alreadyMerged: number[],
-): Promise<{
-  planned: { id: string; title: string; branch: string }[];
-  blocked: { id: string; title: string; blockedBy: number[] }[];
-}> {
-  const remaining = group.issues.filter(
-    (issue) => !alreadyMerged.includes(issue.number),
-  );
-  const blockers = await Promise.all(remaining.map(fetchBlockers));
-
-  const planned: { id: string; title: string; branch: string }[] = [];
-  const blocked: { id: string; title: string; blockedBy: number[] }[] = [];
-
-  for (const [i, issue] of remaining.entries()) {
-    const blockedBy = liveBlockers(blockers[i]!, alreadyMerged);
-    if (blockedBy.length > 0) {
-      blocked.push({ id: String(issue.number), title: issue.title, blockedBy });
-    } else {
-      planned.push({
-        id: String(issue.number),
-        title: issue.title,
-        branch: issueBranchName(issue.number),
-      });
-    }
-  }
-
-  return { planned, blocked };
 }
 
 // ---------------------------------------------------------------------------
@@ -1285,38 +1082,45 @@ function reviewDiffFor(cwd: string, integrationBranch: string, branch: string): 
 async function workIssue(
   issue: { id: string; title: string; branch: string },
   integrationBranch: string,
-  cycleAbort: AbortController,
+  signal: AbortSignal,
 ): Promise<{ commits: { sha: string }[]; completed: boolean }> {
-  const sandbox = await sandcastle.createSandbox({
-    branch: issue.branch,
-    // A new issue branch forks from the batch so far, so it builds on what this
-    // group has already merged. The default is the host's HEAD, which is only
-    // the batch when something has checked it out — and nothing does any more.
-    baseBranch: integrationBranch,
-    sandbox: sandboxProvider(),
-    hooks,
-  });
-
+  // Read from GitHub before the sandbox exists: a throw here would otherwise
+  // leave the sandbox, outside the try that closes it, open until exit (#999's run).
   const issueNumber = Number(issue.id);
-  const issueContext = issueContextFor(issueNumber);
+  const issueContext = await issueContextFor(issueNumber);
   const avoidTerms =
     config.glossaryFile === undefined
       ? undefined
       : extractAvoidTerms(readFileSync(join(REPO_CWD, config.glossaryFile), "utf-8")).join(", ");
+
+  // The onSandboxReady hook installs dependencies, so creation is a heavy phase.
+  const sandbox = await inHeavyPhase(() =>
+    sandcastle.createSandbox({
+      branch: issue.branch,
+      // A new issue branch forks from the batch so far, so it builds on what this
+      // group has already merged. The default is the host's HEAD, which is only
+      // the batch when something has checked it out — and nothing does any more.
+      baseBranch: integrationBranch,
+      sandbox: sandboxProvider(),
+      hooks,
+    }),
+  );
+
   let last: Awaited<ReturnType<typeof sandbox.run>> | undefined;
-  let lastRole = "implementer";
+  /** The agent the step now running was started with; the reviewer's model is only known per review. */
+  let lastAgent: { role: Role; kind: AgentKind; model: string; effort?: RoleEffort; label: string } = {
+    role: "implementer",
+    ...ROLE_PLAN.implementer,
+  };
   let lastOptions: Parameters<typeof sandbox.run>[0] | undefined;
   const toRunResult = (result: Awaited<ReturnType<typeof sandbox.run>>): RunResult => {
     last = result;
-    if (lastRole === "implementer") {
-      // The token table's row and the PR body's "implemented by" line both name
-      // this run's actual implementer, not just the generic role, so an agy
-      // issue and a Claude one read differently in the same batch (#731).
-      runState.recordImplementer(issueNumber, IMPLEMENTER_LABEL);
-      recordImplementerUsage(`#${issue.id}`, result.iterations ?? []);
-    } else {
-      recordSessionUsage(`#${issue.id}`, lastRole, result.iterations ?? []);
-    }
+    // The token table's row and the PR body's "implemented by"/"reviewed by"
+    // lines name the agent that actually ran, not just the generic role, so an
+    // agy issue and a Claude one read differently in the same batch (#731).
+    if (lastAgent.role === "implementer") runState.recordImplementer(issueNumber, lastAgent.label);
+    else runState.recordReviewer(issueNumber, lastAgent.label);
+    runReport.recordRoleUsage(`#${issue.id}`, lastAgent.role, lastAgent, result.iterations ?? []);
     return {
       stdout: result.stdout,
       commits: result.commits,
@@ -1328,40 +1132,48 @@ async function workIssue(
 
   const ports: IssueLoopPorts = {
     startRun: async ({ role, model, resumeSessionId, extraPrompt }) => {
-      lastRole = role;
-      lastOptions =
-        role === "implementer"
-          ? {
-              name: `implementer#${issue.id}`,
-              maxIterations: 1,
-              resumeSession: resumeSessionId,
-              agent: IMPLEMENTER_AGENT,
-              signal: cycleAbort.signal,
-              promptFile: PROMPTS.implement,
-              promptArgs: {
-                TASK_ID: issue.id,
-                ISSUE_TITLE: issue.title,
-                ISSUE_CONTEXT: issueContext,
-                ...(avoidTerms === undefined ? {} : { AVOID_TERMS: avoidTerms }),
-                BRANCH: issue.branch,
-                INTEGRATION_BRANCH: integrationBranch,
-                CHECK_FAILURE: extraPrompt ?? "",
-              },
-            }
-          : {
-              name: `reviewer#${issue.id}`,
-              maxIterations: 1,
-              agent: sandcastle.claudeCode(model!),
-              signal: cycleAbort.signal,
-              promptFile: PROMPTS.review,
-              promptArgs: {
-                ISSUE_CONTEXT: issueContext,
-                BRANCH: issue.branch,
-                INTEGRATION_BRANCH: integrationBranch,
-                DIFF: reviewDiffFor(sandbox.worktreePath, integrationBranch, issue.branch),
-                CHECK_FAILURE: extraPrompt ?? "",
-              },
-            };
+      if (role === "implementer") {
+        lastAgent = { role, ...ROLE_PLAN.implementer };
+        lastOptions = {
+          name: `implementer#${issue.id}`,
+          maxIterations: 1,
+          idleTimeoutSeconds: AGENT_IDLE_TIMEOUT_SECONDS,
+          resumeSession: resumeSessionId,
+          agent: IMPLEMENTER_AGENT,
+          signal,
+          promptFile: PROMPTS.implement,
+          promptArgs: {
+            TASK_ID: issue.id,
+            ISSUE_TITLE: issue.title,
+            ISSUE_CONTEXT: issueContext,
+            ...(avoidTerms === undefined ? {} : { AVOID_TERMS: avoidTerms }),
+            BRANCH: issue.branch,
+            INTEGRATION_BRANCH: integrationBranch,
+            CHECK_FAILURE: extraPrompt ?? "",
+          },
+        };
+      } else {
+        // The loop picks the reviewer's model from the branch's diff before it
+        // starts the review, so it is always named here.
+        const { kind, effort } = ROLE_PLAN.reviewer;
+        const reviewerModel = model!;
+        lastAgent = { role, kind, model: reviewerModel, effort, label: roleLabel(kind, reviewerModel, effort) };
+        lastOptions = {
+          name: `reviewer#${issue.id}`,
+          maxIterations: 1,
+          idleTimeoutSeconds: AGENT_IDLE_TIMEOUT_SECONDS,
+          agent: roleAgent(lastAgent),
+          signal,
+          promptFile: PROMPTS.review,
+          promptArgs: {
+            ISSUE_CONTEXT: issueContext,
+            BRANCH: issue.branch,
+            INTEGRATION_BRANCH: integrationBranch,
+            DIFF: reviewDiffFor(sandbox.worktreePath, integrationBranch, issue.branch),
+            CHECK_FAILURE: extraPrompt ?? "",
+          },
+        };
+      }
       return toRunResult(await sandbox.run(lastOptions));
     },
     // Not `last.resume(prompt)`: the SDK's resume keeps promptArgs and throws; see lib/resumeRun.mts.
@@ -1369,21 +1181,40 @@ async function workIssue(
       toRunResult(
         await sandbox.run(resumeRunOptions(lastOptions!, prompt, last!.iterations.at(-1)!.sessionId!)),
       ),
-    exec: async (command) => sandbox.exec(command),
+    // The check command installs and runs the suites, so it takes a slot too.
+    exec: async (command) => inHeavyPhase(() => sandbox.exec(command)),
+    withCheckSlot: (work) =>
+      withCheckSlot(CHECK_SLOTS_DIR, work, {
+        signal,
+        onWait: () => console.log(`#${issue.id}: waiting for a free check slot…`),
+      }),
     saveWorktree: (reason) => saveWorktree(sandbox.worktreePath, issueNumber, reason),
     writeDone: () => markDone(sandbox.worktreePath, issueNumber, integrationBranch),
-    readSession: () => runState.loadSession(issueNumber),
-    // An agy conversation stays in this sandbox (lib/antigravity.mts), so a later run could never resume it.
+    hasImplementerComplete: () => hasImplementerComplete(sandbox.worktreePath, issueNumber),
+    writeImplementerComplete: () => markImplementerComplete(sandbox.worktreePath, issueNumber),
+    hasReviewerComplete: () => hasReviewerComplete(sandbox.worktreePath, issueNumber),
+    writeReviewerComplete: () => markReviewerComplete(sandbox.worktreePath, issueNumber),
+    readSession: () => runState.loadSession(issueNumber) ?? codexSessions.get(issueNumber),
+    // Only a Claude session is saved for a later run. An agy conversation stays
+    // in this sandbox (lib/antigravity.mts), so a later run could never resume
+    // it. A Codex session could be, but a later run may put another agent on
+    // the role, and the saved id carries no note of whose it is. Within this
+    // process it is kept, so the issue a Codex account swap stopped resumes it
+    // on the new account (#1234); a failed resume starts the issue cold.
     writeSession: (sessionId) => {
-      if (IMPLEMENTER !== "agy") runState.saveSession(issueNumber, sessionId);
+      if (lastAgent.kind === "claude") runState.saveSession(issueNumber, sessionId);
+      else if (lastAgent.kind === "codex") codexSessions.set(issueNumber, sessionId);
     },
-    clearSession: () => runState.clearSession(issueNumber),
-    abortSignal: cycleAbort.signal,
+    clearSession: () => {
+      codexSessions.delete(issueNumber);
+      runState.clearSession(issueNumber);
+    },
+    abortSignal: signal,
     cleanTree: () => cleanTree(sandbox.worktreePath),
     isGreenTree: (tree) => runState.isGreenTree(tree),
     recordGreenTree: (tree) => runState.recordGreenTree(tree),
     reviewerModel: () =>
-      chooseReviewerModel(
+      ROLE_PLAN.reviewer.model(
         changedLines(
           gitIn(sandbox.worktreePath, ["diff", "--numstat", `${integrationBranch}...${issue.branch}`]),
           config.lockfiles,
@@ -1396,10 +1227,12 @@ async function workIssue(
 
   try {
     const outcome = await runIssueLoop(ports, {
+      issueNumber,
       maxSteps: MAX_IMPLEMENTER_ITERATIONS,
       continuePrompt: IMPLEMENTER_CONTINUE_PROMPT,
       checkCommand: withTimeLimit(CHECK_COMMAND),
       formatCommand: config.formatCommand,
+      refreshDepsCommand: config.refreshDepsCommand,
       // Every loop message also goes into the agent log of the run just
       // finished, so a check result or a cold start sits beside the step it
       // follows there, not only in the run log (#810).
@@ -1420,280 +1253,100 @@ async function workIssue(
       );
     }
     return { commits: outcome.commits, completed: outcome.completed };
-  } catch (error) {
-    // The first run-fatal failure stops every sibling at its next step boundary.
-    // Re-derive the fatal error from the text so a thrown SDK error counts too.
-    try {
-      throwIfRunFatal(errorText(error));
-    } catch (fatalError) {
-      if (!cycleAbort.signal.aborted) cycleAbort.abort(fatalError);
-    }
-    throw error;
   } finally {
     await sandbox.close();
   }
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4: the PR
-// ---------------------------------------------------------------------------
-
-/**
- * Push the group's batch and open or refresh its PR.
- *
- * Always a draft while work is outstanding: a partial batch is worth publishing
- * — the next run grows the same PR — but it is not worth anyone's review yet.
- * Once it is complete, the PR writer drafts the body a reviewer reads.
- */
-async function publish(
-  group: Group,
-  integration: IntegrationSandbox,
-  complete: boolean,
-  blocked: { id: string; title: string; blockedBy: number[] }[],
-): Promise<boolean> {
-  const integrationBranch = integration.branch;
-  if (commitsAhead(BASE_REF, integrationBranch) === 0) {
-    console.log(`\n${describeGroup(group.id)}: no commits produced. No PR opened.`);
-    return false;
-  }
-
-  const local = sh(`git rev-parse ${integrationBranch}`);
-  const pushed = shQuiet(`git rev-parse --verify --quiet origin/${integrationBranch}`);
-  if (local === pushed) {
-    console.log(`\n${integrationBranch} is already on origin; nothing to push.`);
-  } else {
-    // --no-verify: the pre-push hook would lint this checkout, not the branch;
-    // CHECK_COMMAND already linted the branch in the sandbox.
-    execSync(`git push --no-verify -u origin ${integrationBranch}`, { stdio: "inherit" });
-  }
-
-  const mergedIssues = resolveMergedIssues(group, integrationBranch);
-  const title = buildPrTitle(group, mergedIssues.length);
-  const writeup = complete
-    ? await integration.writePrBody(
-        mergedIssues.map((issue) => `- ${issue.id}: ${issue.title}`).join("\n"),
-      )
-    : undefined;
-  const body = buildPrBody({
-    group,
-    mergedIssues,
-    blockedIssues: blocked,
-    complete,
-    writeup,
-    implementers: { byIssue: runState.implementedBy(), fallback: CLAUDE_MODEL },
-  });
-
-  const existing = sh(
-    `gh pr list --head ${integrationBranch} --state open --json url --jq ".[0].url // empty"`,
-  );
-
-  // Title and body go to gh as argv, never through a shell. They are built from
-  // issue titles a human wrote and from Markdown that uses backticks, and a
-  // JSON-quoted string is still double-quoted to the shell: backticks and `$`
-  // run as command substitution, and `\n` escapes arrive as literal text. The
-  // first published PR shipped with its group label executed out of the body.
-  if (existing) {
-    execFileSync(
-      "gh",
-      ["pr", "edit", integrationBranch, "--title", title, "--body", body],
-      { stdio: "inherit" },
-    );
-    console.log(`\nRefreshed PR for ${integrationBranch}: ${existing}`);
-  } else {
-    execFileSync(
-      "gh",
-      [
-        "pr", "create", "--draft",
-        "--base", BASE_BRANCH,
-        "--head", integrationBranch,
-        "--title", title,
-        "--body", body,
-      ],
-      { stdio: "inherit" },
-    );
-    console.log(`\nOpened draft PR for ${integrationBranch} → ${BASE_BRANCH}.`);
-  }
-
-  if (complete) {
-    // `gh pr ready` on an already-ready PR is a no-op, so a resumed run that
-    // finishes a group needs no check of the current draft state.
-    sh(`gh pr ready ${integrationBranch}`);
-    console.log(`Group ${describeGroup(group.id)} is complete — PR marked ready for review.`);
-  } else {
-    console.log(`Group ${describeGroup(group.id)} still has outstanding work — PR left as a draft.`);
-  }
-
-  return true;
-}
-
-// ---------------------------------------------------------------------------
 // One group, start to finish
 // ---------------------------------------------------------------------------
 
+/** Wire the group's lifecycle to this run's real GitHub, git, sandbox and clock. */
 async function runGroup(group: Group): Promise<boolean> {
-  console.log(`\n${"=".repeat(70)}`);
-  console.log(`Group ${describeGroup(group.id)} — ${group.issues.length} open issue(s)`);
-  console.log(`${"=".repeat(70)}`);
-
-  const integrationBranch = resolveIntegrationBranch(group);
-  activeIntegrationBranch = integrationBranch;
-
-  // Covers the process-killed-with-Ctrl-C path: nothing else runs between an
-  // interrupted invocation and this one, so this is the only point that ever
-  // sees a worktree left dirty by it.
-  saveDirtyWorktreesAtGroupStart(group);
-
-  const integration = new IntegrationSandbox(integrationBranch);
-  try {
-    return await workGroup(group, integration);
-  } finally {
-    await integration.close();
-  }
-}
-
-/** Phases 0–4 for one group, merging and checking through `integration`. */
-async function workGroup(group: Group, integration: IntegrationSandbox): Promise<boolean> {
-  const integrationBranch = integration.branch;
-
-  await integration.syncWithBase(
-    group.issues.map((issue) => `- ${issue.number}: ${issue.title}`).join("\n"),
-  );
-  await pickUpPriorWork(group, integration);
-
-  let planned: { id: string; title: string; branch: string }[] = [];
-  let blocked: { id: string; title: string; blockedBy: number[] }[] = [];
-  let settledWithNothingToDo = false;
-
-  let stoppedAtEndTime = false;
-  /** Issues the previous cycle merged, which this cycle's plan must not hold. */
-  let justMerged: string[] = [];
-
-  for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
-    if (pastEndTime()) {
-      console.log(`\nEnd time reached — no new cycle for ${describeGroup(group.id)}.`);
-      stoppedAtEndTime = reachedEndTime = true;
-      break;
-    }
-    console.log(`\n=== ${describeGroup(group.id)} — cycle ${iteration}/${MAX_ITERATIONS} ===\n`);
-
-    const alreadyMerged = resolveMergedIssues(group, integrationBranch).map(
-      (issue) => Number(issue.id),
-    );
-    // Rechecked every cycle, not cached: a blocker that closes mid-run — or
-    // whose work this run has just merged — should let its dependent join this
-    // same run, not wait for the next invocation.
-    ({ planned, blocked } = await planGroup(group, alreadyMerged));
-
-    const replanned = replannedAfterMerge(justMerged, planned.map((issue) => issue.id));
-    if (replanned.length > 0) {
-      throw new BranchStateError(
-        `${replanned.map((id) => `#${id}`).join(", ")} merged into ${integrationBranch} last cycle but planned again: their Done markers are not being seen there. Stopping the group rather than re-working finished issues every cycle. Check \`git log ${integrationBranch} --grep=^Sandcastle-Done:\`, then re-run Sandcastle.`,
-      );
-    }
-    justMerged = [];
-
-    if (blocked.length > 0) {
-      console.log(`${blocked.length} issue(s) blocked, skipped this cycle:`);
-      for (const issue of blocked) {
-        console.log(`  #${issue.id}: ${issue.title} (blocked by ${issue.blockedBy.map((n) => `#${n}`).join(", ")})`);
-      }
-    }
-
-    if (planned.length === 0) {
-      // Nothing left that this batch can unblock by itself: every remaining
-      // blocker sits outside the integration branch.
-      console.log("No unblocked issues left in this group.");
-      break;
-    }
-
-    console.log(`${planned.length} issue(s) to work in parallel:`);
-    for (const issue of planned) {
-      console.log(`  ${issue.id}: ${issue.title} → ${issue.branch}`);
-    }
-
-    await integration.assertGreen();
-    recreateStaleBranches(planned, integrationBranch);
-
-    const cycleAbort = new AbortController();
-    const settled = await Promise.allSettled(
-      planned.map((issue) => workIssue(issue, integrationBranch, cycleAbort)),
-    );
-
-    // A fatal failure in any pipeline ends the run, but only after every other
-    // pipeline has settled — killing sibling agents mid-commit would strand
-    // exactly the work this design exists to preserve.
-    for (const outcome of settled) {
-      if (outcome.status !== "rejected") continue;
-      // Rethrown as-is, so the quota stop keeps what it read from the full output.
-      if (outcome.reason instanceof RunFatalError) throw outcome.reason;
-      throwIfRunFatal(errorText(outcome.reason));
-    }
-    for (const [i, outcome] of settled.entries()) {
-      if (outcome.status === "rejected") {
-        console.error(`  ✗ ${planned[i]!.id} (${planned[i]!.branch}) failed: ${outcome.reason}`);
-      }
-    }
-
-    const shared = sharedFailure(
-      settled.flatMap((outcome, i) =>
-        outcome.status === "rejected" ? [{ issue: planned[i]!.id, message: errorMessage(outcome.reason) }] : [],
-      ),
-      planned.length,
-    );
-    if (shared !== undefined) throw sharedFailureStop(shared);
-
-    // "Completed" here means carrying a Done marker for this integration
-    // branch — written inside workIssue once the implementer signalled and
-    // the reviewer finished — not merely having produced a commit.
-    const ready = new Set(
-      readyToMerge(REPO_CWD, integrationBranch, groupIssueBranchDescriptors(group)),
-    );
-    const completed = planned.filter((issue) => ready.has(issue.branch));
-
-    if (completed.length === 0) {
-      console.log("No issues marked done this cycle. Nothing to merge.");
-
-      // Every issue reporting completion with nothing to show for it means the
-      // work was already done. Replanning would ask the same question and get
-      // the same answer, so stop rather than spend the remaining cycles on it.
-      const outcomes = settled.map((outcome) => ({
-        failed: outcome.status === "rejected",
-        commits: outcome.status === "fulfilled" ? outcome.value.commits.length : 0,
-        completed: outcome.status === "fulfilled" && outcome.value.completed,
-      }));
-      if (isSettledWithNothingToDo(outcomes)) {
-        console.log("Every issue reports its work was already done. Group finished.");
-        settledWithNothingToDo = true;
-        break;
-      }
-
-      continue;
-    }
-
-    console.log(`\nMerging ${completed.length} finished branch(es):`);
-    await integration.merge(completed);
-    justMerged = completed.map((issue) => issue.id);
-
-    console.log("\nBranches merged into integration branch.");
-  }
-
-  warnAboutUnfinishedBranches(group, integrationBranch);
-  const stillUnfinished = unfinishedBranches(
-    REPO_CWD,
-    integrationBranch,
-    groupIssueBranchDescriptors(group),
-  ).length;
-  stranded += stillUnfinished;
-
-  // Stopping before planning leaves `planned` empty, which would read as complete.
-  const complete = !stoppedAtEndTime && isGroupComplete({
-    plannedIssues: planned.length,
-    blockedIssues: blocked.length,
-    settledWithNothingToDo,
-    strandedBranches: stillUnfinished,
-  });
-
-  return publish(group, integration, complete, blocked);
+  return runGroupWithPorts({
+    github: {
+      isIssueOpen,
+      issueTitle: async (number) => ghCommand(["issue", "view", String(number), "--json", "title", "--jq", ".title"]),
+      blockers: fetchBlockers,
+      mergedPrHeads: fetchMergedPrHeadBranches,
+      mergedPr: async (head) => {
+        const json = await ghCommand([
+          "pr", "list", "--head", head, "--state", "merged", "--limit", "200",
+          "--json", "number,url,headRefOid",
+        ]);
+        const parsed: unknown = JSON.parse(json);
+        if (
+          !Array.isArray(parsed) ||
+          !parsed.every((entry) =>
+            typeof entry === "object" && entry !== null &&
+            typeof entry.number === "number" && typeof entry.url === "string" &&
+            typeof entry.headRefOid === "string")
+        ) {
+          throw new Error(`Unexpected 'gh pr list' output, expected number/url/headRefOid: ${json}`);
+        }
+        return parsed[0];
+      },
+      openPr: async (head) => ghCommand(["pr", "list", "--head", head, "--state", "open", "--json", "url", "--jq", ".[0].url // empty"]),
+      // Title and body go to gh as argv, never through a shell. They are built
+      // from issue titles a human wrote and from Markdown that uses backticks,
+      // and a JSON-quoted string is still double-quoted to the shell: backticks
+      // and `$` run as command substitution, and `\n` escapes arrive as literal
+      // text. The first published PR shipped with its group label executed out
+      // of the body.
+      editPr: async ({ head, title, body }) => {
+        await ghCommand(["pr", "edit", head, "--title", title, "--body", body]);
+      },
+      createDraftPr: async ({ head, base, title, body }) => {
+        await ghCommand(["pr", "create", "--draft", "--base", base, "--head", head, "--title", title, "--body", body]);
+      },
+      readyPr: async (head) => { await ghCommand(["pr", "ready", head]); },
+    },
+    git: {
+      fetchBase: () => { sh(`git fetch origin ${BASE_BRANCH}`); },
+      branchesMatching,
+      isBatchBranchShipped: (branch, mergedHeads) => isBatchBranchShipped(REPO_CWD, branch, BASE_REF, mergedHeads),
+      createBranch: (branch, from, force) => { sh(`git branch ${force ? "-f " : ""}${branch} ${from}`); },
+      catchUp: fetchAndCatchUp,
+      foreignWorktree: (branch) => foreignWorktreeHolding(REPO_CWD, branch, WORKTREES_DIR),
+      doneIssues: (branch) => doneIssues(REPO_CWD, branch),
+      worktreeExists: (branch) => existsSync(worktreePathOf(branch)),
+      worktreeIsDirty,
+      saveWorktree: (branch, issue) => saveWorktree(worktreePathOf(branch), issue, "found-dirty-at-start"),
+      isStale: (branch) => isStale(REPO_CWD, branch, BASE_REF),
+      resetWorktree: (branch, from) => {
+        execFileSync("git", ["-C", worktreePathOf(branch), "reset", "--hard", from], { encoding: "utf-8" });
+      },
+      commitsAhead,
+      hasFileChanges: (ref, branch) => gitIn(REPO_CWD, ["diff", "--name-only", ref, branch, "--"]) !== "",
+      commitsSince: (ref, branch) => lines(gitIn(REPO_CWD, ["log", "--format=%h %s", `${ref}..${branch}`, "--"])),
+      readyToMerge: (branch, issues) => readyToMerge(REPO_CWD, branch, issues),
+      unfinishedBranches: (branch, issues) => unfinishedBranches(REPO_CWD, branch, issues),
+      resolveCommit: (branch) => sh(`git rev-parse ${branch}`),
+      resolveRemoteCommit: (branch) => shQuiet(`git rev-parse --verify --quiet origin/${branch}`),
+    },
+    push: pushBranch,
+    githubCall,
+    createIntegrationSandbox,
+    runQueue: runGroupQueue,
+    workIssue,
+    clearSession: (issue) => runState.clearSession(issue),
+    prAttribution: () => ({
+      implementers: { byIssue: runState.implementedBy(), fallback: ROLE_PLAN.implementer.label },
+      reviewers: runState.reviewedBy(),
+      merger: runState.batchRole("merger"),
+      prWriter: runState.batchRole("pr-writer"),
+    }),
+    integrationBranchSelected: (branch) => { activeIntegrationBranch = branch; },
+    recordStranded: (count) => { stranded += count; },
+    endTimeReached: () => { reachedEndTime = true; },
+    pastEndTime,
+    sharedFailureStop,
+    waitForGitHub,
+    now: Date.now,
+    log: (message) => console.log(message),
+    warn: (message) => console.warn(message),
+  }, { baseBranch: BASE_BRANCH, baseRef: BASE_REF }, group);
 }
 
 // ---------------------------------------------------------------------------
@@ -1702,7 +1355,7 @@ async function workGroup(group: Group, integration: IntegrationSandbox): Promise
 
 // `refresh` and `prune` cannot collide with a group id: those are a parent
 // issue's number or `solo-<number>`.
-const REFRESHING = REQUESTED_GROUP === "refresh";
+const REFRESHING = REQUESTED_GROUPS[0] === "refresh";
 
 /**
  * `prune`: delete the local Sandcastle branches whose work has shipped, with
@@ -1710,15 +1363,15 @@ const REFRESHING = REQUESTED_GROUP === "refresh";
  * whose worktree holds uncommitted changes is kept. Nothing on origin is
  * touched. Exits the process.
  */
-function pruneBranches(): never {
-  execSync(`git fetch --quiet origin ${BASE_BRANCH}`, { stdio: "inherit" });
+async function pruneBranches(): Promise<never> {
+  await githubCall(() => sh(`git fetch --quiet origin ${BASE_BRANCH}`));
   // A worktree folder deleted by hand still holds its branch until git forgets it.
   sh(`git worktree prune`);
   const { batches, issues } = prunableBranches(REPO_CWD, {
     batchBranches: branchesMatching("sandcastle/batch-*"),
     issueBranches: branchesMatching("sandcastle/issue-*"),
     mainRef: BASE_REF,
-    mergedPrHeadBranches: fetchMergedPrHeadBranches("sandcastle/batch-*"),
+    mergedPrHeadBranches: await fetchMergedPrHeadBranches("sandcastle/batch-*"),
   });
   const branches = [...issues, ...batches];
   if (branches.length === 0) {
@@ -1752,39 +1405,33 @@ function pruneBranches(): never {
   process.exit(0);
 }
 
-if (REQUESTED_GROUP === "prune") pruneBranches();
+if (REQUESTED_GROUPS[0] === "prune") await startupGitHub(pruneBranches);
 
-const allGroups = REFRESHING ? [] : partitionIntoGroups(fetchOpenIssues());
+const allGroups = REFRESHING ? [] : partitionIntoGroups(await startupGitHub(fetchOpenIssues));
 for (const group of allGroups) assertSafeGroupId(group.id);
 
-const groups = REQUESTED_GROUP
-  ? allGroups.filter((group) => group.id === REQUESTED_GROUP)
-  : allGroups;
+let groups = allGroups;
+if (REQUESTED_GROUPS.length > 0 && !REFRESHING) {
+  const resolution = resolveGroupIds(REQUESTED_GROUPS, allGroups);
+  if (!resolution.ok) {
+    console.error(resolution.message);
+    process.exit(1);
+  }
+  groups = resolution.groups;
+}
 
-const refreshTargets = REFRESHING ? openBatchPrBranches() : [];
+const refreshTargets = REFRESHING ? await startupGitHub(openBatchPrBranches) : [];
 if (REFRESHING) {
   if (refreshTargets.length === 0) {
     console.log("No open Sandcastle PRs. Nothing to refresh.");
     process.exit(0);
   }
-  execSync(`git fetch --quiet origin ${BASE_BRANCH} ${refreshTargets.join(" ")}`, {
-    stdio: "inherit",
-  });
+  await startupGitHub(() => sh(`git fetch --quiet origin ${BASE_BRANCH} ${refreshTargets.join(" ")}`));
   console.log(`\n${refreshTargets.length} open Sandcastle PR(s), against ${BASE_REF}:\n`);
   for (const branch of refreshTargets) {
     const behind = isBehind(REPO_CWD, `origin/${branch}`, BASE_REF);
     console.log(`  ${branch} — ${behind ? "behind, will merge main in" : "up to date"}`);
   }
-}
-
-if (!REFRESHING && REQUESTED_GROUP && groups.length === 0) {
-  console.error(
-    // The board listing prints raw ids, not describeGroup's rendering: these
-    // are the strings you type as the argument, and a solo group's argument is
-    // `solo-365`, not the `#365` a message about it would say.
-    `No Sandcastle group or solo issue matches ${JSON.stringify(REQUESTED_GROUP)}. Groups on the board: ${allGroups.map((g) => g.id).join(", ") || "(none)"}`,
-  );
-  process.exit(1);
 }
 
 if (!REFRESHING && groups.length === 0) {
@@ -1801,7 +1448,7 @@ if (!REFRESHING) console.log(`\n${groups.length} group(s), in run order:\n`);
 for (const group of groups) {
   const parent = group.parentIssue ? ` (closes spec #${group.parentIssue} when complete)` : "";
   console.log(`  ${describeGroup(group.id)}${parent}`);
-  const blockersOf = await Promise.all(group.issues.map(fetchBlockers));
+  const blockersOf = await startupGitHub(() => Promise.all(group.issues.map((issue) => fetchBlockers(issue))));
   for (const [i, issue] of group.issues.entries()) {
     const blockers = blockersOf[i]!;
     const suffix =
@@ -1811,10 +1458,23 @@ for (const group of groups) {
   console.log(`    → ${batchBranchGlob(group.id)}, one draft PR`);
 }
 
+if (!REFRESHING) {
+  console.log(`\n${formatRoleBanner(ROLE_PLAN)}`);
+  if (ROLE_PLAN.needsCodexSignIn) {
+    console.log(`  Codex account: ${CODEX_ACCOUNTS?.join(", ") ?? "default sign-in"}`);
+  }
+}
+
+const sandboxImageOptions = {
+  repoCwd: REPO_CWD,
+  imageName: defaultImageName(REPO_CWD),
+  inputFiles: config.imageInputFiles,
+};
+
 if (DRY_RUN) {
-  const freshness = imageFreshness();
+  const freshness = inspectSandboxImage(sandboxImageOptions);
   console.log(
-    `\nSandbox image ${defaultImageName(REPO_CWD)}: ${
+    `\nSandbox image ${sandboxImageOptions.imageName}: ${
       freshness === "current" ? "current" : `${freshness} — a real run would rebuild it`
     }`,
   );
@@ -1831,12 +1491,18 @@ if (DRY_RUN) {
         : `\n${PROVIDER_NAMES[provider]} quota gate: closed — a real run would refuse. Quota resets ${localTime(dryGate.resetAt)} (${dryGate.minutesLeft} min left).`,
     );
   }
-  console.log(`\nImplementer: ${IMPLEMENTER === "agy" ? `agy ${AGY_IMPLEMENTER_MODEL}` : CLAUDE_MODEL}`);
-  if (IMPLEMENTER === "agy") {
+  if (ROLE_PLAN.quotaProviders.includes("gemini")) {
     // The one agent call a dry run makes: a word of Gemini costs nothing next
     // to finding out after the sandboxes are built that its quota is spent.
-    const probe = runQuotaProbe("agy", AGY_IMPLEMENTER_MODEL);
+    const probe = runQuotaProbe("agy", AGY_PROBE_MODEL);
     console.log(`\nGemini quota probe: ${describeQuotaProbe(probe)}`);
+  }
+  if (ROLE_PLAN.quotaProviders.includes("codex")) {
+    // Free: Codex's app-server reports the quota without a model call.
+    for (const account of CODEX_ACCOUNTS ?? [undefined]) {
+      const label = CODEX_ACCOUNTS && CODEX_ACCOUNTS.length > 1 ? ` (account "${account}")` : "";
+      console.log(`\nCodex quota probe${label}: ${describeQuotaProbe(runCodexQuotaProbe(account))}`);
+    }
   }
   console.log("\nReviewer model per planned issue:");
   for (const group of groups) {
@@ -1846,7 +1512,7 @@ if (DRY_RUN) {
         numstat === undefined
           ? "no branch yet — chosen from its diff once the implementer finishes"
           : (({ model, reason }) => `${model} (${reason})`)(
-              chooseReviewerModel(changedLines(numstat, config.lockfiles, config.testFiles)),
+              ROLE_PLAN.reviewer.model(changedLines(numstat, config.lockfiles, config.testFiles)),
             );
       console.log(`  #${issue.number}: ${choice}`);
     }
@@ -1863,93 +1529,77 @@ if (DRY_RUN) {
   process.exit(0);
 }
 
-/** Hash of the lockfiles and Dockerfile as they are now. */
-function currentImageHash(): string {
-  return computeImageHash(
-    config.imageInputFiles.map((name) => ({
-      name,
-      content: readFileSync(join(REPO_CWD, name), "utf-8"),
-    })),
-  );
-}
-
-/** Whether the sandbox image is missing, stale (built from other lockfiles) or current. */
-function imageFreshness(): "missing" | "stale" | "current" {
-  const image = defaultImageName(REPO_CWD);
-  const label = shQuiet(
-    `docker image inspect --format '{{ index .Config.Labels "${IMAGE_HASH_LABEL}" }}' ${image}`,
-  );
-  if (label === undefined) return "missing";
-  return label === currentImageHash() ? "current" : "stale";
-}
-
-/**
- * Build the sandbox image from a context holding only the manifests, lockfiles
- * and Dockerfile, so the repo's node_modules never ship to the Docker daemon.
- * Exits 1 with the end of the build output if the build fails.
- */
-function rebuildImage(): void {
-  console.log(`\nLockfiles changed — rebuilding sandbox image… (about 2-4 minutes)`);
-  const context = mkdtempSync(join(tmpdir(), "sandcastle-image-"));
-  try {
-    for (const name of config.imageInputFiles) {
-      const target = join(context, name === ".sandcastle/Dockerfile" ? "Dockerfile" : name);
-      mkdirSync(dirname(target), { recursive: true });
-      copyFileSync(join(REPO_CWD, name), target);
-    }
-    const uid = sh("id -u");
-    const gid = sh("id -g");
-    execSync(
-      `docker build -t ${defaultImageName(REPO_CWD)} --label ${IMAGE_HASH_LABEL}=${currentImageHash()} ` +
-        `--build-arg AGENT_UID=${uid} --build-arg AGENT_GID=${gid} ${context}`,
-      {
-        stdio: ["ignore", "pipe", "pipe"],
-        maxBuffer: 256 * 1024 * 1024,
-        // The Dockerfile's `RUN --mount=type=cache` steps need BuildKit.
-        env: { ...process.env, DOCKER_BUILDKIT: "1" },
-      },
-    );
-    console.log("Sandbox image rebuilt.");
-  } catch (error) {
-    const e = error as { stdout?: Buffer; stderr?: Buffer };
-    const output = `${e.stdout ?? ""}${e.stderr ?? ""}`;
-    console.error(
-      `\nSandbox image build failed. End of the build output:\n${output.slice(-CHECK_OUTPUT_TAIL_CHARS)}`,
-    );
-    process.exit(1);
-  } finally {
-    rmSync(context, { recursive: true, force: true });
-  }
-}
-
 /**
  * Refuse to start a run the sandboxes cannot possibly survive.
  *
  * A stopped Docker daemon or a missing image fails every sandbox in exactly the
  * same way, and it fails them by *throwing* out of createSandbox — which
  * bypasses both the dead-iteration breaker and the fatal-output check, so the
- * run burns every cycle of every group retrying a machine that cannot change
+ * run burns every attempt of every group retrying a machine that cannot change
  * mid-run. The costlier half is quieter: a failed create tears down the
  * worktree it had just prepared, so uncommitted work a previous run left behind
  * to be resumed is deleted by a run that never got as far as reading it. One
  * second of checking here is cheaper than either.
  */
-function preflightSandbox(): void {
-  if (shQuiet(`docker info`) === undefined) {
-    console.error(
-      `\nDocker is not responding — every sandbox would fail to start. Open Docker Desktop, wait for it to finish starting, then re-run Sandcastle.`,
-    );
+async function preflightSandbox(): Promise<void> {
+  try {
+    await preflightDocker({
+      probe: (timeout) => {
+        try {
+          execFileSync("docker", ["info"], { stdio: "ignore", timeout });
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      start: (command, timeout) => {
+        console.log("\nDocker is not responding — running the configured start command and waiting up to 3 minutes…");
+        execSync(command, { stdio: "ignore", timeout });
+      },
+      now: () => performance.now(),
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    }, config.dockerStartCommand);
+  } catch (error) {
+    console.error(`\n${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   }
 
-  if (imageFreshness() !== "current") rebuildImage();
+  if (inspectSandboxImage(sandboxImageOptions) !== "current") {
+    console.log(`\nSandbox image ${sandboxImageOptions.imageName} is stale — rebuilding… (about 2-4 minutes)`);
+  }
+  try {
+    if (prepareSandboxImage(sandboxImageOptions) === "rebuilt") {
+      console.log("Sandbox image rebuilt.");
+    }
+  } catch (error) {
+    const stdout = error instanceof Error && "stdout" in error ? error.stdout : "";
+    const stderr = error instanceof Error && "stderr" in error ? error.stderr : "";
+    const output = `${stdout ?? ""}${stderr ?? ""}` || String(error);
+    console.error(
+      `\nSandbox image build failed. End of the build output:\n${output.slice(-CHECK_OUTPUT_TAIL_CHARS)}`,
+    );
+    process.exit(1);
+  }
 }
 
-preflightSandbox();
+await preflightSandbox();
 
 // Each provider's gate in turn, so a spent Gemini quota at startup is slept
 // through like a spent Claude one — each on its own reset, never past the end.
+// With several Codex accounts, begin on the first with quota. The saved reset
+// of a single account says nothing about the others, so the live readings
+// replace the Codex gate here; if every account is spent, the Codex probe below
+// stops or waits under the same rules as a mid-run stop.
+const MULTI_CODEX = (CODEX_ACCOUNTS?.length ?? 0) > 1;
+if (MULTI_CODEX && ROLE_PLAN.quotaProviders.includes("codex") && !DRY_RUN) {
+  const first = CODEX_ACCOUNTS!.find((account) => !readCodexQuota(account)?.spent);
+  if (first !== undefined && first !== CODEX_ACCOUNT) {
+    console.log(`\nCodex account "${CODEX_ACCOUNT}" is out of quota; starting on "${first}".`);
+    switchCodexAccount(first);
+  }
+}
 for (const provider of QUOTA_PROVIDERS) {
+  if (provider === "codex" && MULTI_CODEX) continue;
   const gate = quotaGate(runState.readQuotaReset(provider), new Date(), IGNORE_QUOTA_GATE);
   if (gate.allowed) continue;
   const plan = planQuotaWait({
@@ -1968,7 +1618,9 @@ for (const provider of QUOTA_PROVIDERS) {
   }
   await sleepUntil(plan.until, `${PROVIDER_NAMES[provider]} quota is spent.`);
 }
-const startGate = quotaGate(runState.readQuotaReset("claude"), new Date(), IGNORE_QUOTA_GATE);
+const startGate: QuotaGateDecision = ROLE_PLAN.quotaProviders.includes("claude")
+  ? quotaGate(runState.readQuotaReset("claude"), new Date(), IGNORE_QUOTA_GATE)
+  : { allowed: true };
 
 const startBranch = sh(`git rev-parse --abbrev-ref HEAD`);
 
@@ -2024,6 +1676,13 @@ async function sleepUntil(wakeAt: Date, why: string): Promise<void> {
   while (Date.now() < wakeAt.getTime()) {
     await new Promise((resolve) => setTimeout(resolve, Math.min(wakeAt.getTime() - Date.now(), 60_000)));
   }
+}
+
+/** Push once with captured output; the group owns logging and outage retry. */
+async function pushBranch(branch: string): Promise<void> {
+  // --no-verify: the pre-push hook would lint this checkout, not the branch;
+  // CHECK_COMMAND already linted the branch in the sandbox.
+  execSync(`git push --no-verify -u origin ${branch}`, { stdio: "pipe" });
 }
 
 const CLAUDE_PROBE_MODEL = "claude-haiku-4-5";
@@ -2096,7 +1755,11 @@ function describeQuotaProbe(probe: QuotaProbe): string {
 
 /** Every provider's saved reset, for the wait planner to pick the stopped one's from. */
 function quotaResets(): Record<QuotaProvider, Date | undefined> {
-  return { claude: runState.readQuotaReset("claude"), gemini: runState.readQuotaReset("gemini") };
+  return {
+    claude: runState.readQuotaReset("claude"),
+    gemini: runState.readQuotaReset("gemini"),
+    codex: runState.readQuotaReset("codex"),
+  };
 }
 
 /**
@@ -2119,6 +1782,80 @@ function readGeminiQuotaReset(): { resetAt: Date; kind: QuotaStopKind } | undefi
 }
 
 /**
+ * Codex's quota as its app-server on the host reports it (lib/codex.mts).
+ * Undefined, with a warning, when the server can't be asked or read.
+ * `account` names a listed account to read under its own home; omitted, the run's current `CODEX_HOME`.
+ */
+function readCodexQuota(account?: string): CodexQuotaReading | undefined {
+  try {
+    const env = account === undefined ? process.env : { ...process.env, CODEX_HOME: resolveCodexHome(account) };
+    return parseCodexRateLimits(appServerRequest("account/rateLimits/read", {}, env), new Date());
+  } catch (error) {
+    console.warn(`\nWarning: could not read Codex's quota from \`codex app-server\` — ${(error as Error).message}`);
+    return undefined;
+  }
+}
+
+/**
+ * Codex's quota probe: free, since the app-server reads the quota without a model call.
+ * `account` names a listed account to probe under its own home; omitted, the run's current `CODEX_HOME`.
+ */
+function runCodexQuotaProbe(account?: string): QuotaProbe {
+  let reading: CodexQuotaReading;
+  try {
+    // Under that account's CODEX_HOME when one is named; otherwise the run's own.
+    const env = account === undefined ? process.env : { ...process.env, CODEX_HOME: resolveCodexHome(account) };
+    reading = parseCodexRateLimits(appServerRequest("account/rateLimits/read", {}, env), new Date());
+  } catch (error) {
+    const why =
+      error instanceof CodexMissingError ? error.message : `\`codex app-server\` failed: ${(error as Error).message}`;
+    return { kind: "no-answer", why };
+  }
+  if (!reading.spent) return { kind: "clear" };
+  const when = reading.resetAt ? ` until ${localTime(reading.resetAt)}` : "";
+  return {
+    kind: "stop",
+    stop: new RunFatalError("quota", `Codex reports its ${reading.kind} limit spent${when}`, {
+      resetAt: reading.resetAt,
+      quotaStop: reading.kind,
+      provider: "codex",
+      reason: "Codex usage limit reached — re-run when it resets",
+    }),
+  };
+}
+
+/** The stop Codex's probe found, saying so when it could not answer at all. */
+function probeCodexQuota(): RunFatalError | undefined {
+  const probe = runCodexQuotaProbe();
+  if (probe.kind === "no-answer") console.warn(`\nWarning: Codex quota not checked — ${probe.why}.`);
+  return probe.kind === "stop" ? probe.stop : undefined;
+}
+
+/** Codex sessions of this run by issue number, resumed after an account swap. */
+const codexSessions = new Map<number, string>();
+
+/**
+ * Carry on with another listed Codex account (#1234): point `CODEX_HOME` and the
+ * run state at it, renew its access token when it would not outlast the run, and
+ * re-stage the sandbox sign-in. Staging rewrites the staged file in place, so
+ * every running sandbox's bind mount follows it without a rebuild.
+ */
+function switchCodexAccount(account: string): void {
+  CODEX_ACCOUNT = account;
+  process.env.CODEX_HOME = resolveCodexHome(account);
+  runState.useCodexAccount(account);
+  const expiresAt = accessTokenExpiry(readFileSync(codexAuthFile(), "utf-8"));
+  if (expiresAt !== undefined && expiresAt.getTime() - Date.now() < MIN_ACCESS_TOKEN_LIFE_MS) {
+    try {
+      renewHostCodexSignIn();
+    } catch (error) {
+      console.warn(`\nWarning: could not renew Codex account "${account}"'s sign-in — ${(error as Error).message}`);
+    }
+  }
+  stageCodexAuth(CODEX_STAGED_AUTH);
+}
+
+/**
  * The one quota path, shared by an agent's quota stop and the probe: record the
  * stopped provider's reset time and, while waiting is on, sleep until it — or,
  * with no reset time known, an hour at a time with a probe of that provider
@@ -2130,11 +1867,30 @@ async function handleQuotaStop(stop: RunFatalError): Promise<RunFatalError | und
   while (current.kind === "quota") {
     const provider = current.provider;
     let kind = current.quotaStop ?? "session";
-    if (provider === "gemini") {
+    let codexAccounts: { accounts: string[]; current: string; readings: Record<string, CodexQuotaReading | undefined> } | undefined;
+    if (provider === "codex") {
+      const reading = readCodexQuota();
+      if (reading?.spent) {
+        if (reading.resetAt) runState.recordQuotaReset("codex", reading.resetAt);
+        kind = reading.kind;
+      }
+      if (CODEX_ACCOUNTS && CODEX_ACCOUNTS.length > 1 && CODEX_ACCOUNT !== undefined) {
+        const readings: Record<string, CodexQuotaReading | undefined> = { [CODEX_ACCOUNT]: reading };
+        for (const account of CODEX_ACCOUNTS) {
+          if (account === CODEX_ACCOUNT) continue;
+          const other = readCodexQuota(account);
+          readings[account] = other;
+          if (other?.spent && other.resetAt) runState.recordQuotaReset("codex", other.resetAt, account);
+        }
+        codexAccounts = { accounts: CODEX_ACCOUNTS, current: CODEX_ACCOUNT, readings };
+      }
+    } else if (provider === "gemini") {
       const reset = readGeminiQuotaReset();
       if (reset) {
         runState.recordQuotaReset("gemini", reset.resetAt);
         kind = reset.kind;
+      } else if (current.resetAt) {
+        runState.recordQuotaReset("gemini", current.resetAt);
       }
     } else if (current.resetAt) {
       runState.recordQuotaReset("claude", current.resetAt);
@@ -2146,43 +1902,72 @@ async function handleQuotaStop(stop: RunFatalError): Promise<RunFatalError | und
       now: new Date(),
       waiting: WAIT_FOR_QUOTA,
       endAt: END_AT,
+      codex: codexAccounts,
     });
     const name = PROVIDER_NAMES[provider];
+    if (plan.swapTo !== undefined) {
+      console.log(`\nCodex account "${CODEX_ACCOUNT}" is out of quota; switching to "${plan.swapTo}".`);
+      switchCodexAccount(plan.swapTo);
+      return undefined;
+    }
+    if (provider === "codex") {
+      const resetAt = quotaResets().codex;
+      const allSpent = codexAccounts?.accounts.map((account) => {
+        const reading = codexAccounts.readings[account];
+        const at = (reading?.spent ? reading.resetAt : undefined) ?? (account === CODEX_ACCOUNT ? resetAt : undefined);
+        return { account, resetAt: at && localTime(at) };
+      });
+      console.error(`\n${codexQuotaStopMessage(CODEX_ACCOUNT, resetAt && localTime(resetAt), plan.wait, allSpent)}`);
+    }
     if (!plan.wait) {
       if (WAIT_FOR_QUOTA) console.error(`\nNot waiting for the ${name} quota: ${plan.reason}.`);
       return current;
     }
+    // Waiting on another account: carry on with it once it has reset.
+    const continueOn = (): void => {
+      if (plan.account === undefined || plan.account === CODEX_ACCOUNT) return;
+      console.log(`\nCodex account "${CODEX_ACCOUNT}" is out of quota; switching to "${plan.account}".`);
+      switchCodexAccount(plan.account);
+    };
     if (!plan.recheck) {
       await sleepUntil(plan.until, `${name} quota stop (reset plus ${QUOTA_WAIT_MARGIN_MS / 60_000} minutes).`);
+      continueOn();
       return undefined;
     }
     await sleepUntil(plan.until, `${name} quota stop with no reset time — checking again in an hour.`);
+    continueOn();
     const again =
-      provider === "gemini" ? probeQuota("agy", AGY_IMPLEMENTER_MODEL) : probeQuota("claude", CLAUDE_PROBE_MODEL);
+      provider === "codex"
+        ? probeCodexQuota()
+        : provider === "gemini"
+          ? probeQuota("agy", AGY_PROBE_MODEL)
+          : probeQuota("claude", CLAUDE_PROBE_MODEL);
     if (!again) return undefined;
     current = again;
   }
   return current;
 }
 
-if (shouldProbeQuota(startGate, runState.readQuotaReset("claude"), new Date(), DRY_RUN)) {
+if (
+  ROLE_PLAN.quotaProviders.includes("claude") &&
+  shouldProbeQuota(startGate, runState.readQuotaReset("claude"), new Date(), DRY_RUN)
+) {
   const probeStop = probeQuota("claude", CLAUDE_PROBE_MODEL);
   if (probeStop) fatal = await handleQuotaStop(probeStop);
 }
 
 // A spent Gemini quota has to stop the run before any sandbox is built too,
-// so the implementer's own probe follows Claude's (#729).
-if (!fatal && IMPLEMENTER === "agy") {
-  const agyProbeStop = probeQuota("agy", AGY_IMPLEMENTER_MODEL);
+// whenever any role in the plan is agy.
+if (!fatal && ROLE_PLAN.quotaProviders.includes("gemini")) {
+  const agyProbeStop = probeQuota("agy", AGY_PROBE_MODEL);
   if (agyProbeStop) fatal = await handleQuotaStop(agyProbeStop);
 }
 
-const RESUME_ADVICE: Record<Exclude<FailureKind, "local">, string> = {
-  quota: "Re-run Sandcastle when your quota resets.",
-  auth: "Log the agent in, then re-run Sandcastle.",
-  network: "Check the sandbox's connectivity, then re-run Sandcastle.",
-  shared: "Fix what the failure above names — the machine, a login or the quota, since every issue met it — then re-run Sandcastle.",
-};
+// And a spent Codex quota, whenever any role in the plan is Codex.
+if (!fatal && ROLE_PLAN.quotaProviders.includes("codex")) {
+  const codexProbeStop = probeCodexQuota();
+  if (codexProbeStop) fatal = await handleQuotaStop(codexProbeStop);
+}
 
 /**
  * `refresh`: merge main into every open batch PR that is behind it, and push.
@@ -2198,25 +1983,20 @@ async function refreshBatchPrs(branches: string[]): Promise<never> {
     activeIntegrationBranch = branch;
     console.log(`\n=== Refresh ${branch} ===`);
     try {
-      if (branchesMatching(branch).length === 0) {
-        sh(`git branch ${branch} origin/${branch}`);
-      } else {
-        catchUpIntegrationBranch(branch);
-      }
-      if (!isBehind(REPO_CWD, branch, BASE_REF)) {
-        console.log(`Already up to date with ${BASE_REF}.`);
-        continue;
-      }
-      const integration = new IntegrationSandbox(branch);
-      try {
-        const prTitle = sh(`gh pr view ${branch} --json title --jq .title`);
-        await integration.syncWithBase(`- the PR "${prTitle}"`);
-      } finally {
-        await integration.close();
-      }
-      // --no-verify for the same reason as the integration-branch push.
-      execSync(`git push --no-verify origin ${branch}`, { stdio: "inherit" });
-      refreshed++;
+      const pushed = await refreshBranch({
+        git: {
+          branchesMatching,
+          createBranch: (head, from) => { sh(`git branch ${head} ${from}`); },
+          catchUp: fetchAndCatchUp,
+          isBehindBase: (head) => isBehind(REPO_CWD, head, BASE_REF),
+        },
+        prTitle: async (head) => ghCommand(["pr", "view", head, "--json", "title", "--jq", ".title"]),
+        createIntegrationSandbox,
+        push: pushBranch,
+        githubCall,
+        log: (message) => console.log(message),
+      }, { baseRef: BASE_REF }, branch);
+      if (pushed) refreshed++;
     } catch (error) {
       let stop = runFatalStop(error);
       if (stop) {

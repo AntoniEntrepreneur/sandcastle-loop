@@ -28,10 +28,13 @@ const setupCommand = [
 ].join(" && ");
 
 export const config: ProjectConfig = {
+  dockerStartCommand: process.platform === "darwin" ? "open -a Docker" : undefined,
   setupCommand,
+  // `ci` installs the lockfile's exact versions and never rewrites it.
+  refreshDepsCommand: "npm ci && npm ci --prefix frontend && uv sync --frozen",
   checkCommand: "make test && make lint",
   // Exactly what pre-commit's black hook covers.
-  formatCommand: "uv run black backend tests",
+  formatCommand: "uv run black backend scripts tests",
   imageInputFiles: [
     "package.json",
     "package-lock.json",
@@ -45,13 +48,24 @@ export const config: ProjectConfig = {
   // pytest's tree, vitest's tree, and the loop's own `*.test.mts`.
   testFiles: [/^tests\//, /^frontend\/test\//, /\.test\.m?tsx?$/],
   // npm's cache is content-addressed and uv locks its own, so both are safe to
-  // share between concurrent sandboxes.
+  // share between concurrent sandboxes — except that two npm installs can race
+  // a rename into it (EEXIST); the check re-runs once on that (isInstallRace).
   cacheMounts: [
     { name: "npm", sandboxPath: "/home/agent/.npm" },
     { name: "uv", sandboxPath: "/home/agent/.cache/uv" },
   ],
   // uv cannot hardlink across the bind mounts, so it is told to copy rather
   // than warn about falling back to it.
-  sandboxEnv: { UV_LINK_MODE: "copy" },
+  // The host config points core.hooksPath at an absolute path the sandbox
+  // does not mount; git env-config points it back at the repo's .githooks.
+  sandboxEnv: {
+    UV_LINK_MODE: "copy",
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "core.hooksPath",
+    GIT_CONFIG_VALUE_0: ".githooks",
+  },
   glossaryFile: "GLOSSARY.md",
+  // The same hook and rules a Codex session on the host loads from .codex/.
+  codexHooksFile: ".codex/hooks.json",
+  codexRulesDir: ".codex/rules",
 };

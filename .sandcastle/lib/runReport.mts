@@ -1,5 +1,110 @@
-// Run visibility helpers: the token-use table and log retention. Pure; main.mts
-// does the file and console work.
+// Own per-run token attribution, provider accounting, rendering and log-retention selection.
+
+import { readFileSync } from "node:fs";
+import type { IterationResult, IterationUsage } from "@ai-hero/sandcastle";
+import { agyThinkingTokens } from "./antigravity.mts";
+import { codexSessionUsage } from "./codex.mts";
+import type { RoleAgent } from "./rolePlan.mts";
+import type { Role } from "./issueLoop.mts";
+import type { BatchRole } from "./runState.mts";
+
+/** Account for completed issue and batch iterations within one run. */
+export class RunReport {
+  private readonly usageRows: UsageRow[] = [];
+  private readonly countedMessages = new Set<string>();
+  private readonly countedCodexEvents = new Set<string>();
+  private readonly agyConversationTotals = new Map<string, IterationUsage & { thinkingTokens: number }>();
+  private readonly startedMs: number;
+
+  /** Set the cutoff shared by all captured sessions in this run. */
+  constructor(startedMs: number) {
+    this.startedMs = startedMs;
+  }
+
+  /** Render the recorded steps and their combined totals. */
+  render(): string {
+    return formatUsageTable(this.usageRows);
+  }
+
+  /**
+   * Read and parse every iteration's captured session file, best-effort: a
+   * missing or unreadable capture is skipped rather than failing the run.
+   */
+  private recordCapturedUsage(
+    issue: string,
+    role: string,
+    iterations: readonly IterationResult[],
+    parse: (
+      jsonl: string,
+      sinceMs: number,
+      counted: Set<string>,
+    ) => Required<Pick<UsageRow, "inputTokens" | "outputTokens" | "cacheReadTokens">>,
+    counted: Set<string>,
+  ): void {
+    for (const { sessionFilePath } of iterations) {
+      if (!sessionFilePath) continue;
+      let jsonl: string;
+      try {
+        jsonl = readFileSync(sessionFilePath, "utf-8");
+      } catch {
+        continue;
+      }
+      this.usageRows.push({ issue, role, ...parse(jsonl, this.startedMs, counted) });
+    }
+  }
+
+  /**
+   * Record the token use of one finished Claude step from its captured session.
+   * The iteration's own `usage` is not read: it is the last message's context
+   * window, not what the step spent (lib/runReport.mts).
+   */
+  private recordSessionUsage(issue: string, role: string, iterations: readonly IterationResult[]): void {
+    this.recordCapturedUsage(issue, role, iterations, sessionUsage, this.countedMessages);
+  }
+
+  /**
+   * Record the token use of one finished `agy` step from the totals its stream
+   * reported (#731). `agy` copies no session to the host, so there is no JSONL
+   * to dedupe against. A resumed conversation reports its cumulative usage
+   * (checked against `agy` 1.4.6, #788), so each step records the difference from
+   * the conversation's previous total.
+   */
+  private recordStreamUsage(issue: string, role: string, iterations: readonly IterationResult[]): void {
+    for (const { usage, sessionId } of iterations) {
+      if (!usage) continue;
+      const total = { ...usage, thinkingTokens: agyThinkingTokens(usage) };
+      const prev = sessionId ? this.agyConversationTotals.get(sessionId) : undefined;
+      if (sessionId) this.agyConversationTotals.set(sessionId, total);
+      this.usageRows.push({
+        issue,
+        role,
+        ...streamStepUsage(total, prev),
+      });
+    }
+  }
+
+  /** Record the token use of a Codex step from its captured session file (lib/codex.mts). */
+  private recordCodexUsage(issue: string, role: string, iterations: readonly IterationResult[]): void {
+    this.recordCapturedUsage(issue, role, iterations, codexSessionUsage, this.countedCodexEvents);
+  }
+
+  /**
+   * Record a role's token use from wherever its agent left it: an agy role's own
+   * stream, in a row named after the model that ran; a Codex role's captured
+   * session, in a row named after its label; a Claude role's captured session,
+   * in a row named after the role (#731/#802).
+   */
+  recordRoleUsage(
+    issue: string,
+    role: Role | BatchRole,
+    agent: Pick<RoleAgent, "kind" | "model" | "label">,
+    iterations: readonly IterationResult[],
+  ): void {
+    if (agent.kind === "agy") this.recordStreamUsage(issue, agent.model, iterations);
+    else if (agent.kind === "codex") this.recordCodexUsage(issue, agent.label, iterations);
+    else this.recordSessionUsage(issue, role, iterations);
+  }
+}
 
 /** Tokens one agent step used, attributed to an issue and a role. */
 export interface UsageRow {
@@ -11,6 +116,30 @@ export interface UsageRow {
   thinkingTokens?: number;
   /** Prompt tokens served from cache, kept out of `inputTokens` because they cost a fraction of it. */
   cacheReadTokens?: number;
+}
+
+/** The usage one `agy` iteration's stream result reports. */
+export interface StreamUsageInput {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly thinkingTokens?: number;
+  readonly cacheReadInputTokens?: number;
+}
+
+/**
+ * The tokens an `agy` step spent: for a resumed conversation whose stream
+ * reports cumulative totals, only the difference from the previous total.
+ */
+export function streamStepUsage(
+  usage: StreamUsageInput,
+  previous?: StreamUsageInput,
+): Required<Pick<UsageRow, "inputTokens" | "outputTokens" | "thinkingTokens" | "cacheReadTokens">> {
+  return {
+    inputTokens: usage.inputTokens - (previous?.inputTokens ?? 0),
+    outputTokens: usage.outputTokens - (previous?.outputTokens ?? 0),
+    thinkingTokens: (usage.thinkingTokens ?? 0) - (previous?.thinkingTokens ?? 0),
+    cacheReadTokens: (usage.cacheReadInputTokens ?? 0) - (previous?.cacheReadInputTokens ?? 0),
+  };
 }
 
 /**

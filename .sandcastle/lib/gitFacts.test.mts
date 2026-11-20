@@ -7,21 +7,28 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   catchUpWithRemote,
+  foreignWorktreeHolding,
   doneIssues,
   gitAnswered,
+  hasImplementerComplete,
+  hasReviewerComplete,
   isBatchBranchShipped,
   isBehind,
   isStale,
   markDone,
+  markImplementerComplete,
+  markPrWritten,
+  markReviewerComplete,
   mergeEach,
   prunableBranches,
   readyToMerge,
+  recordedPr,
   saveWorktree,
   cleanTree,
   unfinishedBranches,
@@ -138,6 +145,117 @@ test("a Done marker naming a different integration branch doesn't count", () => 
       readyToMerge(dir, "integration-a", [{ issueNumber: 1, branch: "sandcastle/issue-1" }]),
       ["sandcastle/issue-1"],
     );
+  } finally {
+    cleanup();
+  }
+});
+
+// --- implementer complete marker -----------------------------------------
+
+test("markImplementerComplete writes trailer and hasImplementerComplete recognises it", () => {
+  const { dir, cleanup } = makeRepo();
+  try {
+    assert.equal(hasImplementerComplete(dir, 42), false);
+    markImplementerComplete(dir, 42);
+    assert.equal(hasImplementerComplete(dir, 42), true);
+    assert.equal(hasImplementerComplete(dir, 99), false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("when a commit lands after markImplementerComplete, hasImplementerComplete is invalidated", () => {
+  const { dir, cleanup } = makeRepo();
+  try {
+    markImplementerComplete(dir, 42);
+    assert.equal(hasImplementerComplete(dir, 42), true);
+
+    commitFile(dir, "fix.txt", "fix content\n", "a later commit");
+    assert.equal(hasImplementerComplete(dir, 42), false);
+  } finally {
+    cleanup();
+  }
+});
+
+// --- reviewer complete marker --------------------------------------------
+
+test("markReviewerComplete writes trailer and hasReviewerComplete recognises it", () => {
+  const { dir, cleanup } = makeRepo();
+  try {
+    assert.equal(hasReviewerComplete(dir, 42), false);
+    markReviewerComplete(dir, 42);
+    assert.equal(hasReviewerComplete(dir, 42), true);
+    assert.equal(hasReviewerComplete(dir, 99), false);
+    // Code reviewed is also code implemented
+    assert.equal(hasImplementerComplete(dir, 42), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("when a commit lands after markReviewerComplete, hasReviewerComplete is invalidated", () => {
+  const { dir, cleanup } = makeRepo();
+  try {
+    markReviewerComplete(dir, 42);
+    assert.equal(hasReviewerComplete(dir, 42), true);
+
+    commitFile(dir, "fix.txt", "fix content\n", "a later commit");
+    assert.equal(hasReviewerComplete(dir, 42), false);
+  } finally {
+    cleanup();
+  }
+});
+
+// --- PR body marker ------------------------------------------------------
+
+test("markPrWritten records the body, and recordedPr reads it back off the named branch", () => {
+  const { dir, cleanup } = makeRepo();
+  try {
+    git(dir, ["checkout", "-b", "sandcastle/batch-1", "--quiet"]);
+    assert.equal(recordedPr(dir, "sandcastle/batch-1")?.body, undefined);
+
+    markPrWritten(dir, "sandcastle/batch-1", { body: "## Summary\n\nFixed something." });
+    // Read off the branch, not whatever this checkout happens to have out.
+    git(dir, ["checkout", "main", "--quiet"]);
+    assert.equal(recordedPr(dir, "sandcastle/batch-1")?.body, "## Summary\n\nFixed something.");
+  } finally {
+    cleanup();
+  }
+});
+
+test("markPrWritten records the title beside the body, and a marker without one reads back with no title", () => {
+  const { dir, cleanup } = makeRepo();
+  try {
+    markPrWritten(dir, "main", { title: "Return the cached result when a save is unchanged", body: "## Summary" });
+    assert.deepEqual(recordedPr(dir, "main"), {
+      title: "Return the cached result when a save is unchanged",
+      body: "## Summary",
+    });
+    markPrWritten(dir, "main", { body: "## Summary" });
+    assert.deepEqual(recordedPr(dir, "main"), { body: "## Summary" });
+  } finally {
+    cleanup();
+  }
+});
+
+test("a PR body written for another batch is not this branch's", () => {
+  const { dir, cleanup } = makeRepo();
+  try {
+    git(dir, ["checkout", "-b", "sandcastle/batch-1", "--quiet"]);
+    markPrWritten(dir, "sandcastle/batch-1", { body: "## Summary" });
+    git(dir, ["branch", "sandcastle/batch-2"]);
+    assert.equal(recordedPr(dir, "sandcastle/batch-2")?.body, undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+test("when a commit lands after markPrWritten, the recorded PR body is gone", () => {
+  const { dir, cleanup } = makeRepo();
+  try {
+    markPrWritten(dir, "main", { body: "## Summary" });
+    commitFile(dir, "fix.txt", "fix content\n", "a later commit");
+    assert.equal(recordedPr(dir, "main")?.body, undefined);
   } finally {
     cleanup();
   }
@@ -362,7 +480,7 @@ test("a batch branch never pushed has no remote to catch up with", () => {
   const { dir, cleanup } = makeRepo();
   try {
     git(dir, ["branch", "batch", "main"]);
-    assert.equal(catchUpWithRemote(dir, "batch", "origin/batch"), "no-remote");
+    assert.equal(catchUpWithRemote(dir, "batch", "origin/batch", "owned"), "no-remote");
   } finally {
     cleanup();
   }
@@ -375,7 +493,7 @@ test("a batch branch behind its remote copy is fast-forwarded to it", () => {
     commitFile(dir, "main.txt", "update\n", "update main");
     setRemote(dir, "batch", "main");
 
-    assert.equal(catchUpWithRemote(dir, "batch", "origin/batch"), "fast-forwarded");
+    assert.equal(catchUpWithRemote(dir, "batch", "origin/batch", "owned"), "fast-forwarded");
     assert.equal(git(dir, ["rev-parse", "batch"]), git(dir, ["rev-parse", "main"]));
   } finally {
     cleanup();
@@ -384,13 +502,13 @@ test("a batch branch behind its remote copy is fast-forwarded to it", () => {
 
 test("a batch branch checked out in a worktree is fast-forwarded there, files included", () => {
   const { dir, cleanup } = makeRepo();
-  const worktree = mkdtempSync(join(tmpdir(), "gitfacts-wt-"));
+  const worktree = join(dir, "owned", "batch");
   try {
     commitFile(dir, "main.txt", "update\n", "update main");
     setRemote(dir, "batch", "main");
     git(dir, ["worktree", "add", "--quiet", "-b", "batch", worktree, "main~1"]);
 
-    assert.equal(catchUpWithRemote(dir, "batch", "origin/batch"), "fast-forwarded");
+    assert.equal(catchUpWithRemote(dir, "batch", "origin/batch", "owned"), "fast-forwarded");
     assert.equal(git(worktree, ["rev-parse", "HEAD"]), git(dir, ["rev-parse", "main"]));
     assert.equal(git(worktree, ["status", "--porcelain"]), "");
   } finally {
@@ -407,7 +525,7 @@ test("a batch branch ahead of its remote copy keeps its local commits", () => {
     commitFile(dir, "local.txt", "local\n", "local work");
     const tip = git(dir, ["rev-parse", "batch"]);
 
-    assert.equal(catchUpWithRemote(dir, "batch", "origin/batch"), "up-to-date");
+    assert.equal(catchUpWithRemote(dir, "batch", "origin/batch", "owned"), "up-to-date");
     assert.equal(git(dir, ["rev-parse", "batch"]), tip);
   } finally {
     cleanup();
@@ -424,7 +542,7 @@ test("a batch branch diverged from its remote copy is left untouched", () => {
     commitFile(dir, "remote.txt", "remote\n", "remote work");
     setRemote(dir, "batch", "main");
 
-    assert.equal(catchUpWithRemote(dir, "batch", "origin/batch"), "diverged");
+    assert.equal(catchUpWithRemote(dir, "batch", "origin/batch", "owned"), "diverged");
     assert.equal(git(dir, ["rev-parse", "batch"]), tip);
   } finally {
     cleanup();
@@ -575,6 +693,32 @@ test("an issue branch already on main is prunable without a batch", () => {
       }),
       { batches: [], issues: ["sandcastle/issue-1"] },
     );
+  } finally {
+    cleanup();
+  }
+});
+
+/** Catch-up cannot change a foreign checkout, including a similarly prefixed folder. */
+test("a foreign worktree keeps its HEAD and loose files when its remote has moved", () => {
+  const { dir, cleanup } = makeRepo();
+  const worktree = join(dir, "owned-sibling", "hand fix żółć\nsession");
+  try {
+    commitFile(dir, "main.txt", "update\n", "update main");
+    setRemote(dir, "batch", "main");
+    git(dir, ["worktree", "add", "--quiet", "-b", "batch", worktree, "main~1"]);
+    writeFileSync(join(worktree, "README.md"), "unfinished hand fix\n");
+    writeFileSync(join(worktree, "loose.txt"), "loose work\n");
+    const head = git(worktree, ["rev-parse", "HEAD"]);
+    const status = git(worktree, ["status", "--porcelain"]);
+
+    assert.equal(foreignWorktreeHolding(dir, "batch", "owned"), worktree);
+    assert.equal(foreignWorktreeHolding(dir, "missing", "owned"), undefined);
+    assert.throws(() => catchUpWithRemote(dir, "batch", "origin/batch", "owned"), (error) =>
+      error instanceof Error && error.message.includes(worktree));
+    assert.equal(git(worktree, ["rev-parse", "HEAD"]), head);
+    assert.equal(git(worktree, ["status", "--porcelain"]), status);
+    assert.equal(readFileSync(join(worktree, "README.md"), "utf8"), "unfinished hand fix\n");
+    assert.equal(readFileSync(join(worktree, "loose.txt"), "utf8"), "loose work\n");
   } finally {
     cleanup();
   }

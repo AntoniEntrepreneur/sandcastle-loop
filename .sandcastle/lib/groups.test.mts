@@ -9,8 +9,12 @@ import {
   buildPrBody,
   buildPrTitle,
   checkFailureTail,
+  isGitHubUnreachable,
+  isInstallRace,
   classifyFailure,
-  mergerFailureVerdict,
+  parseQuotaResetIn,
+  resolveGroupIds,
+  type Group,
   withTimeLimit,
   describeGroup,
   groupIdOf,
@@ -23,6 +27,9 @@ import {
   parentIssueOf,
   parseBlockedByLine,
   parseDoneTrailers,
+  parseImplementerTrailers,
+  parsePrBodyTrailers,
+  parseReviewerTrailers,
   partitionIntoGroups,
   replannedAfterMerge,
   sharedFailure,
@@ -190,6 +197,65 @@ test("a commit message with only one of the two trailers is not a Done marker", 
 
 test("an ordinary commit message is not a Done marker", () => {
   assert.equal(parseDoneTrailers("RALPH: implement feature"), undefined);
+});
+
+// --- Implementer marker trailers --------------------------------------------
+
+test("a commit message with implementer trailer parses as an Implementer marker", () => {
+  const message = [
+    "Sandcastle: #410 implementer complete",
+    "",
+    "Sandcastle-Implementer: #410",
+  ].join("\n");
+  assert.deepEqual(parseImplementerTrailers(message), { issue: 410 });
+});
+
+test("an ordinary commit message is not an Implementer marker", () => {
+  assert.equal(parseImplementerTrailers("RALPH: implement feature"), undefined);
+  assert.equal(parseImplementerTrailers("Sandcastle: #410 done\n\nSandcastle-Done: #410"), undefined);
+});
+
+// --- Reviewer marker trailers -----------------------------------------------
+
+test("a commit message with reviewer trailer parses as a Reviewer marker", () => {
+  const message = [
+    "Sandcastle: #410 reviewer complete",
+    "",
+    "Sandcastle-Reviewer: #410",
+  ].join("\n");
+  assert.deepEqual(parseReviewerTrailers(message), { issue: 410 });
+});
+
+test("an ordinary commit message is not a Reviewer marker", () => {
+  assert.equal(parseReviewerTrailers("RALPH: implement feature"), undefined);
+  assert.equal(parseReviewerTrailers("Sandcastle: #410 done\n\nSandcastle-Done: #410"), undefined);
+  assert.equal(
+    parseReviewerTrailers("Sandcastle: #410 implementer complete\n\nSandcastle-Implementer: #410"),
+    undefined,
+  );
+});
+
+// --- PR-body trailer --------------------------------------------------------
+
+test("a PR-body trailer parses as a marker carrying the branch and the body", () => {
+  const message = [
+    "Sandcastle: PR body complete",
+    "",
+    "## Summary",
+    "",
+    "Fixed something.",
+    "",
+    "Sandcastle-Pr-Body: sandcastle/batch-218",
+  ].join("\n");
+  assert.deepEqual(parsePrBodyTrailers(message), {
+    batch: "sandcastle/batch-218",
+    body: "## Summary\n\nFixed something.",
+  });
+});
+
+test("an ordinary commit message is not a PR-body marker", () => {
+  assert.equal(parsePrBodyTrailers("RALPH: implement feature"), undefined);
+  assert.equal(parsePrBodyTrailers("Sandcastle: #410 done\n\nSandcastle-Done: #410"), undefined);
 });
 
 test("the session-limit message is classified as quota exhaustion, fatal to the whole run", () => {
@@ -374,11 +440,89 @@ test("a merged issue's PR body names who implemented it, falling back for an unr
     ],
     blockedIssues: [],
     complete: true,
-    implementers: { byIssue: { "244": "gemini-3.8-flash-high (agy)" }, fallback: "claude-sonnet-5" },
+    implementers: { byIssue: { "244": "gemini-3.8-flash-medium (agy)" }, fallback: "claude-sonnet-5" },
   });
 
-  assert.ok(body.includes("#244: implemented by gemini-3.8-flash-high (agy)"));
+  assert.ok(body.includes("#244: implemented by gemini-3.8-flash-medium (agy)"));
   assert.ok(body.includes("#245: implemented by claude-sonnet-5"));
+});
+
+/** Pins that labelling every role with a Claude model prints what the body printed before #802. */
+test("an all-Claude batch's PR body is unchanged", () => {
+  const withoutRoles = buildPrBody({
+    group: { id: "218", parentIssue: 218, issues: [] },
+    mergedIssues: [{ id: "245", title: "Something Claude built" }],
+    blockedIssues: [],
+    complete: true,
+    implementers: { byIssue: {}, fallback: "claude-sonnet-5" },
+  });
+
+  const withClaudeRoles = buildPrBody({
+    group: { id: "218", parentIssue: 218, issues: [] },
+    mergedIssues: [{ id: "245", title: "Something Claude built" }],
+    blockedIssues: [],
+    complete: true,
+    implementers: { byIssue: { "245": "claude-sonnet-5" }, fallback: "claude-sonnet-5" },
+    reviewers: { "245": "claude-sonnet-5" },
+    merger: "claude-sonnet-5",
+    prWriter: "claude-sonnet-5",
+  });
+
+  assert.equal(withClaudeRoles, withoutRoles);
+});
+
+/** Pins that the PR body prints one line per role that ran on agy. */
+test("the PR body prints one line per role that ran on agy", () => {
+  const body = buildPrBody({
+    group: { id: "218", parentIssue: 218, issues: [] },
+    mergedIssues: [{ id: "244", title: "Something Gemini built" }],
+    blockedIssues: [],
+    complete: true,
+    implementers: { byIssue: { "244": "gemini-3.8-flash-medium (agy)" }, fallback: "claude-sonnet-5" },
+    reviewers: { "244": "gemini-3.8-flash-medium (agy)" },
+    merger: "gemini-3.8-flash-medium (agy)",
+    prWriter: "gemini-3.8-flash-medium (agy)",
+  });
+
+  assert.ok(body.includes("#244: implemented by gemini-3.8-flash-medium (agy)"));
+  assert.ok(body.includes("#244: reviewed by gemini-3.8-flash-medium (agy)"));
+  assert.ok(body.includes("Merged by gemini-3.8-flash-medium (agy)"));
+  assert.ok(body.includes("PR body written by gemini-3.8-flash-medium (agy)"));
+});
+
+/** Pins that the PR body names an agy reviewer when only the reviewer ran on agy (#803). */
+test("the PR body names an agy reviewer", () => {
+  const body = buildPrBody({
+    group: { id: "218", parentIssue: 218, issues: [] },
+    mergedIssues: [{ id: "244", title: "Something Claude built" }],
+    blockedIssues: [],
+    complete: true,
+    implementers: { byIssue: { "244": "claude-sonnet-5" }, fallback: "claude-sonnet-5" },
+    reviewers: { "244": "gemini-3.8-flash-medium (agy)" },
+  });
+
+  assert.ok(body.includes("#244: implemented by claude-sonnet-5"));
+  assert.ok(body.includes("#244: reviewed by gemini-3.8-flash-medium (agy)"));
+  assert.ok(!body.includes("Merged by"));
+  assert.ok(!body.includes("PR body written by"));
+});
+
+/** Pins that an agy PR writer is named in the PR body while Claude roles are not (#805). */
+test("the PR body names an agy PR writer", () => {
+  const body = buildPrBody({
+    group: { id: "218", parentIssue: 218, issues: [] },
+    mergedIssues: [{ id: "244", title: "Something Claude built" }],
+    blockedIssues: [],
+    complete: true,
+    implementers: { byIssue: { "244": "claude-sonnet-5" }, fallback: "claude-sonnet-5" },
+    reviewers: { "244": "claude-sonnet-5" },
+    merger: "claude-sonnet-5",
+    prWriter: "gemini-3.8-flash-medium (agy)",
+  });
+
+  assert.ok(body.includes("PR body written by gemini-3.8-flash-medium (agy)"));
+  assert.ok(!body.includes("Merged by"));
+  assert.ok(!body.includes("reviewed by"));
 });
 
 /** Pins that a caller that names no implementers gets the body it got before #731. */
@@ -405,18 +549,50 @@ test("a group with a blocked issue lists it and why, even though the batch is co
   assert.ok(body.includes("#242: Render the expression (blocked by #239)"));
 });
 
-test("the PR title names the spec a group serves", () => {
+/** Pins that an issue with no blockers is listed as out of attempts, not as "blocked by ". */
+test("an excluded issue with no blockers is listed as out of attempts", () => {
+  const body = buildPrBody({
+    group: { id: "218", parentIssue: 218, issues: [] },
+    mergedIssues: [{ id: "245", title: "Emit expression structure" }],
+    blockedIssues: [{ id: "242", title: "Render the expression", blockedBy: [] }],
+    complete: false,
+  });
+
+  assert.ok(body.includes("#242: Render the expression (ran out of attempts)"));
+});
+
+const lockIssue = { title: "Lock a Chapter until its previous Chapter is Flawless" };
+
+test("a batch serving a parent spec takes the spec's title", () => {
   assert.equal(
-    buildPrTitle({ id: "218", parentIssue: 218, issues: [] }, 3),
-    "Sandcastle: #218 — 3 issue(s)",
+    buildPrTitle({ id: "218", parentIssue: 218, issues: [] }, [lockIssue, lockIssue], "Teach dividing a whole number by a fraction"),
+    "Teach dividing a whole number by a fraction",
   );
 });
 
-test("a solo group's PR title names the issue itself", () => {
+test("a solo group's PR title is the issue's own title", () => {
   assert.equal(
-    buildPrTitle({ id: "solo-999", parentIssue: undefined, issues: [] }, 1),
-    "Sandcastle: #999 — 1 issue(s)",
+    buildPrTitle({ id: "solo-999", parentIssue: undefined, issues: [] }, [lockIssue], undefined),
+    "Lock a Chapter until its previous Chapter is Flawless",
   );
+});
+
+test("a batch with no parent spec names its first merged issue and counts the rest", () => {
+  const group = { id: "ui", parentIssue: undefined, issues: [] };
+  assert.equal(
+    buildPrTitle(group, [lockIssue, { title: "Rename the button" }], undefined),
+    "Lock a Chapter until its previous Chapter is Flawless, and 1 more change",
+  );
+  assert.equal(
+    buildPrTitle(group, [lockIssue, { title: "A" }, { title: "B" }], undefined),
+    "Lock a Chapter until its previous Chapter is Flawless, and 2 more changes",
+  );
+});
+
+test("a batch with nothing merged yet names the group's issues, and an empty group falls back to its label", () => {
+  const issue = { number: 7, title: "Rename the button", labels: [] };
+  assert.equal(buildPrTitle({ id: "ui", parentIssue: undefined, issues: [issue] }, [], undefined), "Rename the button");
+  assert.equal(buildPrTitle({ id: "ui", parentIssue: undefined, issues: [] }, [], undefined), "sandcastle:ui");
 });
 
 // --- a cycle that had nothing to do ---------------------------------------
@@ -545,6 +721,31 @@ test("withTimeLimit escapes single quotes in the command", () => {
   assert.equal(withTimeLimit("echo 'hi'"), `timeout 1800 sh -c 'echo '\\''hi'\\'''`);
 });
 
+/** Pins the three ways gh and git said GitHub was gone in #999's run. */
+test("isGitHubUnreachable reads gh's and git's lost-GitHub messages", () => {
+  assert.equal(isGitHubUnreachable("error connecting to api.github.com\ncheck your internet connection"), true);
+  assert.equal(isGitHubUnreachable("fatal: unable to access 'https://github.com/x.git/': Could not resolve host: github.com"), true);
+  assert.equal(isGitHubUnreachable("Failed to connect to github.com port 443"), true);
+});
+
+/** Pins that an ordinary failure, or another host, is not read as GitHub being gone. */
+test("isGitHubUnreachable ignores other failures", () => {
+  assert.equal(isGitHubUnreachable("Agent idle for 600 seconds"), false);
+  assert.equal(isGitHubUnreachable("Could not resolve host: registry.npmjs.org"), false);
+});
+
+/** Pins that npm's own EEXIST/ENOTEMPTY line reads as an install race, wherever npm printed it. */
+test("isInstallRace reads npm's EEXIST or ENOTEMPTY error line on either stream", () => {
+  assert.equal(isInstallRace("", "npm warn x\nnpm error code EEXIST\nnpm error syscall rename"), true);
+  assert.equal(isInstallRace("npm ERR! code ENOTEMPTY\n", ""), true);
+});
+
+/** Pins that a test failure merely mentioning the code, or another npm error, is no race. */
+test("isInstallRace ignores a quoted code and other npm errors", () => {
+  assert.equal(isInstallRace("expected 'npm error code EEXIST' to match", ""), false);
+  assert.equal(isInstallRace("", "npm error code ERESOLVE\n"), false);
+});
+
 /** Pins that checkFailureTail is undefined for a green check. */
 test("checkFailureTail is undefined for a green check", () => {
   assert.equal(checkFailureTail(0, "ok", "", 100), undefined);
@@ -570,66 +771,113 @@ test("checkFailureTail counts a timeout (exit 124) as red and says it timed out"
   assert.match(tail, /timed out after 30 minutes/);
 });
 
-/** Pins that mergerFailureVerdict rethrows quota and auth failures. */
-test("mergerFailureVerdict rethrows quota and auth failures", () => {
-  assert.equal(mergerFailureVerdict("You've hit your session limit"), "rethrow");
-  assert.equal(mergerFailureVerdict("Invalid API key"), "rethrow");
-});
-
-/** Pins that mergerFailureVerdict judges an idle timeout by what the merger left. */
-test("mergerFailureVerdict judges an idle timeout by what the merger left", () => {
-  assert.equal(mergerFailureVerdict("Idle timeout: no output for 600s"), "judge-branch");
+/** Pins that the PR body names an agy merger (#804). */
+test("the PR body names an agy merger", () => {
+  const body = buildPrBody({
+    group: { id: "218", parentIssue: 218, issues: [] },
+    mergedIssues: [{ id: "245", title: "Something Claude built" }],
+    blockedIssues: [],
+    complete: true,
+    merger: "gemini-3.8-flash-medium (agy)",
+  });
+  assert.ok(body.includes("Merged by gemini-3.8-flash-medium (agy)"));
 });
 
 const limitStop = "AgentError: claude-code exited with code 1:\nYou've hit your 5-hour limit · resets 1:20am (UTC)";
 
 /** Pins the overnight run of 2026-10-28, where an unmatched quota wording failed every issue for five cycles. */
-test("every planned issue failing with the same message is a shared failure", () => {
+test("two different issues failing with the same message are a shared failure", () => {
   assert.equal(
-    sharedFailure(
-      [
-        { issue: "837", message: limitStop },
-        { issue: "838", message: limitStop },
-      ],
-      2,
-    ),
+    sharedFailure({ issue: "837", message: limitStop }, { issue: "838", message: limitStop }),
     limitStop,
   );
 });
 
 test("failures that differ only by their own issue number are still shared", () => {
-  const failures = ["837", "838"].map((issue) => ({
+  const failure = (issue: string) => ({
     issue,
     message: `Implementer for #${issue} produced nothing in 3 consecutive iterations`,
-  }));
-  assert.equal(sharedFailure(failures, 2), failures[0]!.message);
+  });
+  assert.equal(sharedFailure(failure("837"), failure("838")), failure("838").message);
 });
 
-test("one planned issue failing proves nothing shared", () => {
-  assert.equal(sharedFailure([{ issue: "837", message: limitStop }], 1), undefined);
+test("the same issue failing twice is that issue's problem, not a shared failure", () => {
+  const failure = { issue: "837", message: limitStop };
+  assert.equal(sharedFailure(failure, failure), undefined);
 });
 
-test("a cycle where some issue did not fail has no shared failure", () => {
-  const failures = [
-    { issue: "837", message: limitStop },
-    { issue: "838", message: limitStop },
-  ];
-  assert.equal(sharedFailure(failures, 3), undefined);
+test("no earlier failure means no shared failure", () => {
+  assert.equal(sharedFailure(undefined, { issue: "837", message: limitStop }), undefined);
 });
 
 test("different failure messages are not a shared failure", () => {
-  const failures = [
-    { issue: "837", message: limitStop },
-    { issue: "838", message: "AgentError: claude-code exited with code 1:\nTypeError: x is undefined" },
-  ];
-  assert.equal(sharedFailure(failures, 2), undefined);
+  assert.equal(
+    sharedFailure(
+      { issue: "837", message: limitStop },
+      { issue: "838", message: "AgentError: claude-code exited with code 1:\nTypeError: x is undefined" },
+    ),
+    undefined,
+  );
 });
 
 /** Pins #855's symptom: merged issues re-planned because their Done markers went unseen. */
-test("an issue merged last cycle and planned again is replanned after merge", () => {
+test("an issue merged by this run and planned again is replanned after merge", () => {
   assert.deepEqual(replannedAfterMerge(["837", "840"], ["837", "838", "840"]), ["837", "840"]);
 });
 
-test("a plan holding none of last cycle's merges is not a replan", () => {
+test("a plan holding none of this run's merges is not a replan", () => {
   assert.deepEqual(replannedAfterMerge(["837"], ["839", "845"]), []);
+});
+
+test("an issue merged by an earlier merge of the run counts, not only the latest", () => {
+  assert.deepEqual(replannedAfterMerge(["837", "838", "840"], ["838", "845"]), ["838"]);
+});
+
+test("nothing merged yet means nothing is replanned", () => {
+  assert.deepEqual(replannedAfterMerge([], ["837"]), []);
+});
+
+/** Pins the relative reset wording of agy's quota error, in every shape it can shorten to. */
+test("parseQuotaResetIn reads a relative reset", () => {
+  const now = new Date(0);
+  assert.equal(parseQuotaResetIn("Resets in 2h2m19s.", now)?.getTime(), 7339_000);
+  assert.equal(parseQuotaResetIn("resets in 45m", now)?.getTime(), 2700_000);
+  assert.equal(parseQuotaResetIn("Resets in 9s", now)?.getTime(), 9_000);
+  assert.equal(parseQuotaResetIn("Resets in a while", now), undefined);
+  assert.equal(parseQuotaResetIn("no time named", now), undefined);
+});
+
+const board = (): Group[] =>
+  partitionIntoGroups([
+    { number: 251, title: "a", labels: ["sandcastle:251"] },
+    { number: 252, title: "b", labels: ["sandcastle:251"] },
+    { number: 278, title: "c", labels: ["sandcastle:278"] },
+    { number: 555, title: "d", labels: ["sandcastle"] },
+    { number: 300, title: "e", labels: ["sandcastle", "sandcastle:telemetry"] },
+    { number: 400, title: "f", labels: ["sandcastle:400"] },
+    { number: 400, title: "g", labels: ["sandcastle"] },
+  ]);
+
+/** Pins that ids resolve in typed order, a bare N falls back to the solo issue, and solo-N works (#836). */
+test("resolveGroupIds keeps typed order and resolves bare numbers to a group, then a solo issue", () => {
+  const result = resolveGroupIds(["555", "278", "solo-555", "251"], board());
+  assert.equal(result.ok, true);
+  if (result.ok) assert.deepEqual(result.groups.map((g) => g.id), ["solo-555", "278", "251"]);
+});
+
+/** Pins that nothing resolves unless every id does, and the error names each one (#836). */
+test("resolveGroupIds names every unresolved id, a number inside a group, and a number that is both", () => {
+  const unknown = resolveGroupIds(["278", "999", "nope"], board());
+  assert.equal(unknown.ok, false);
+  if (!unknown.ok) {
+    assert.match(unknown.message, /"999", "nope"/);
+    assert.match(unknown.message, /Groups on the board: .*solo-555/);
+  }
+  const inside = resolveGroupIds(["252"], board());
+  if (!inside.ok) assert.match(inside.message, /#252 is in group sandcastle:251 — run 251 instead/);
+  else assert.fail("252 should not resolve");
+  const both = resolveGroupIds(["400"], board());
+  assert.equal(both.ok, false);
+  const hash = resolveGroupIds(["#278"], board());
+  assert.equal(hash.ok, false);
 });
